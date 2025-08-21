@@ -1,8 +1,5 @@
-Frame-by-frame-AI-parser (视频解析工具包)
-🚀 智能视频内容解析工具 | 将视频自动转换为结构化文字描述
-
-https://img.shields.io/badge/Release-v2.00-green https://img.shields.io/badge/Dependency-FFmpeg-important https://img.shields.io/badge/Powered%2520By-AI%2520Models-brightgreen
-
+Frame-by-frame AI Parser (视频解析工具包)
+<p align="center"> <strong>🚀 智能视频内容解析工具 | 将视频自动转换为结构化文字描述</strong> </p><p align="center"> <img src="https://img.shields.io/badge/Release-v2.00-green" alt="Release"> <img src="https://img.shields.io/badge/Dependency-FFmpeg-important" alt="FFmpeg"> <img src="https://img.shields.io/badge/Powered%20By-AI%20Models-brightgreen" alt="AI Powered"> </p>
 Frame-by-frame-AI-parser 是一款集视频处理、AI图像分析和环境自动配置于一体的智能工具包。它能够自动解析视频内容，通过先进的视觉大模型（VLM）将每一帧画面转换为连贯、精准的自然语言描述，极大地简化了视频内容分析、生成字幕和场景摘要的工作流。
 
 ✨ 核心特性
@@ -10,12 +7,12 @@ Frame-by-frame-AI-parser 是一款集视频处理、AI图像分析和环境自�
 
 🎬 智能视频抽帧：采用差分算法自动过滤静态或重复的无意义帧，只提取关键画面，显著提升处理效率与解析质量。
 
-text
-**🌐 现代化Web界面**：基于 **Streamlit** 构建直观、优雅的图形化操作界面，告别繁琐的命令行操作，提供流畅的用户体验。
-text
-**⚙️ 一站式环境配置**：运行前自动检测系统环境，无需手动干预，即可自动安装配置 `FFmpeg` 并验证 `API` 密钥，真正做到开箱即用。
-text
-  **📄 高质量文本生成**：生成包含场景、物体、动作、人物关系等关键信息的详细且连贯的文字描述。
+🌐 现代化Web界面：基于 Streamlit 构建直观、优雅的图形化操作界面，告别繁琐的命令行操作，提供流畅的用户体验。
+
+⚙️ 一站式环境配置：运行前自动检测系统环境，无需手动干预，即可自动安装配置 FFmpeg 并验证 API 密钥，真正做到开箱即用。
+
+📄 高质量文本生成：生成包含场景、物体、动作、人物关系等关键信息的详细且连贯的文字描述。
+
 🛠️ 工作原理
 输入视频：通过Web界面上传您的视频文件。
 
@@ -43,7 +40,7 @@ AI 解析：将帧图像发送至配置好的视觉大模型进行深度分析�
 bash
 # 1. 克隆本仓库
 git clone https://github.com/JucieOvo/Frame-by-frame-AI-parser_by_JucieOvo.git
-cd your-repo-name
+cd Frame-by-frame-AI-parser_by_JucieOvo
 
 # 2. 启动主程序
 python run.py
@@ -55,12 +52,12 @@ python run.py
 API 密钥 (可选): 如果您使用云端模型（如Qwen-VL），需要提前准备相应的API Key。程序内会引导您配置。
 
 🆚 版本历史
-v2.00 (Current)： 最新版本更新！引入智能差分抽帧、全新的Streamlit Web UI、支持Ollama本地模型。
+v2.00 (最新版本)： 引入智能差分抽帧、全新的Streamlit Web UI、支持Ollama本地模型。
 
-v1.00： 初始版本，提供基础的视频拆帧、Qwen-VL API调用和自动化环境配置功能。查看旧版本文档
+v1.00： 初始版本，提供基础的视频拆帧、Qwen-VL API调用和自动化环境配置功能。
 
 🤝 贡献
-我们欢迎任何形式的贡献！无论是提交 Bug、提出新功能建议，还是直接发起 Pull Request，都非常感谢。请阅读 贡献指南 开始吧。
+我们欢迎任何形式的贡献！无论是提交 Bug、提出新功能建议，还是直接发起 Pull Request，都非常感谢。
 
 📄 许可证
 本项目基于 MIT License 开源。
