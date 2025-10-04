@@ -449,7 +449,7 @@ python run.py
 ### 联系方式
 - **QQ**: 153115068（请备注来意）
 - **邮箱**: 153115068@qq.com
-- **议题**: [GitHub Issues](https://github.com/yourusername/video-analysis-suite/issues)
+- **议题**: [GitHub Issues](https://github.com/JucieOvo/Frame-by-frame-AI-parser_by_JucieOvo/issues)
 
 ### Bug 反馈要求
 请提供以下信息以便快速定位问题：
