@@ -1,0 +1,78 @@
+# 视频智能分析处理套件 v3.0 依赖包
+# Video Intelligent Analysis Processing Suite v3.0 Dependencies
+
+# 核心框架 Core Framework
+streamlit>=1.28.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# 视频处理 Video Processing
+opencv-python>=4.8.0
+scenedetect>=0.6.2
+ffmpeg-python>=0.2.0
+
+# 图像处理 Image Processing
+Pillow>=10.0.0
+
+# 语音识别 Speech Recognition
+funasr>=1.0.0
+modelscope>=1.9.0
+torch>=2.0.0
+torchaudio>=2.0.0
+tf-keras>=2.15.0
+transformers>=4.30.0
+
+# 多模态AI模型 Multimodal AI Models
+ollama>=0.1.7
+openai>=1.0.0
+dashscope>=1.14.0
+
+# RAG和向量数据库 RAG and Vector Database
+langchain>=1.0.0
+
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+
+# 文本处理 Text Processing
+jieba>=0.42.1
+
+# 并发和异步处理 Concurrency and Async Processing
+asyncio
+aiohttp>=3.8.0
+
+# 进度条和UI增强 Progress Bar and UI Enhancement
+tqdm>=4.65.0
+stqdm>=0.0.5
+
+# 系统工具 System Tools
+psutil>=5.9.0
+requests>=2.31.0
+
+# 数据序列化 Data Serialization
+json5>=0.9.0
+pydantic>=2.0.0
+addict>=2.4.0
+
+# 日志和调试 Logging and Debugging
+loguru>=0.7.0
+
+# 环境变量管理 Environment Variable Management
+python-dotenv>=1.0.0
+
+# 文件操作 File Operations
+pathlib2>=2.3.7
+glob2>=0.7
+
+# 时间处理 Time Processing
+python-dateutil>=2.8.2
+
+# 数学计算 Mathematical Computing
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# 网络请求 Network Requests
+httpx>=0.24.0
+
+# 配置文件处理 Configuration File Processing
+pyyaml>=6.0
+toml>=0.10.2
