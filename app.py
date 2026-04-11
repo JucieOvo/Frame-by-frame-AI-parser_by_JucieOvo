@@ -7,33 +7,35 @@ import subprocess
 
 # --- 关键：在导入任何模型相关库之前，先设置环境变量 ---
 # 获取程序目录
-if getattr(sys, 'frozen', False):
+if getattr(sys, "frozen", False):
     _program_dir = os.path.dirname(sys.executable)
 else:
     _program_dir = os.path.dirname(os.path.abspath(__file__))
 
-_cache_dir = os.path.join(_program_dir, '.cache')
+_cache_dir = os.path.join(_program_dir, ".cache")
 
 # 强制覆盖所有可能的环境变量
-os.environ['MODELSCOPE_CACHE_DIR'] = os.path.join(_cache_dir, 'modelscope', 'hub')
-os.environ['MODELSCOPE_CACHE'] = os.path.join(_cache_dir, 'modelscope', 'hub')
-os.environ['MODELSCOPE_HOME'] = os.path.join(_cache_dir, 'modelscope')
-os.environ['HF_HOME'] = os.path.join(_cache_dir, 'huggingface')
-os.environ['HF_HUB_CACHE'] = os.path.join(_cache_dir, 'huggingface', 'hub')
-os.environ['TRANSFORMERS_CACHE'] = os.path.join(_cache_dir, 'huggingface', 'transformers')
-os.environ['TORCH_HOME'] = os.path.join(_cache_dir, 'torch')
+os.environ["MODELSCOPE_CACHE_DIR"] = os.path.join(_cache_dir, "modelscope", "hub")
+os.environ["MODELSCOPE_CACHE"] = os.path.join(_cache_dir, "modelscope", "hub")
+os.environ["MODELSCOPE_HOME"] = os.path.join(_cache_dir, "modelscope")
+os.environ["HF_HOME"] = os.path.join(_cache_dir, "huggingface")
+os.environ["HF_HUB_CACHE"] = os.path.join(_cache_dir, "huggingface", "hub")
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(
+    _cache_dir, "huggingface", "transformers"
+)
+os.environ["TORCH_HOME"] = os.path.join(_cache_dir, "torch")
 
 # 禁用自动下载
-os.environ['MODELSCOPE_SDK_DEBUG'] = '0'
-os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-os.environ['HF_HUB_OFFLINE'] = '0'
+os.environ["MODELSCOPE_SDK_DEBUG"] = "0"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
 
 # 创建必要的目录
 for _dir in [
-    os.environ['MODELSCOPE_CACHE_DIR'],
-    os.environ['HF_HOME'],
-    os.environ['TRANSFORMERS_CACHE'],
-    os.environ['TORCH_HOME']
+    os.environ["MODELSCOPE_CACHE_DIR"],
+    os.environ["HF_HOME"],
+    os.environ["TRANSFORMERS_CACHE"],
+    os.environ["TORCH_HOME"],
 ]:
     os.makedirs(_dir, exist_ok=True)
 
@@ -67,222 +69,305 @@ import psutil
 import json
 from typing import List
 import torch
+
 # ollama客户端
 from ollama import Client
+
 client = Client(host="http://localhost:11434")
+
+# 关键帧图片支持的扩展名集合。
+# 统一集中定义，避免不同读取入口的过滤规则不一致。
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+DEFAULT_KEYFRAME_DIR = os.path.join(_program_dir, "keyframes")
+
 
 # 环境变量已经在文件开头设置，这里只是保留函数用于兼容性
 def get_program_cache_dir():
     """获取程序缓存目录"""
     return _cache_dir
 
+
+def normalize_user_path(path_value, base_dir=None):
+    """规范化用户输入路径，兼容 Unicode 字符、相对路径和常见包裹引号。"""
+    if path_value is None:
+        return ""
+
+    normalized_path = str(path_value).strip()
+    if not normalized_path:
+        return ""
+
+    quote_pairs = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+    start_char = normalized_path[0]
+    end_char = normalized_path[-1]
+    if quote_pairs.get(start_char) == end_char:
+        normalized_path = normalized_path[1:-1].strip()
+
+    if not normalized_path:
+        return ""
+
+    normalized_path = os.path.expandvars(os.path.expanduser(normalized_path))
+    normalized_path = normalized_path.replace("/", os.sep).replace("\\", os.sep)
+
+    base_path = base_dir or _program_dir
+    if not os.path.isabs(normalized_path):
+        normalized_path = os.path.join(base_path, normalized_path)
+
+    return os.path.normpath(os.path.abspath(normalized_path))
+
+
+def list_image_files(directory):
+    """安全读取目录中的图片文件，避免特殊字符路径被 glob 模式误判。"""
+    normalized_dir = normalize_user_path(directory)
+    if not normalized_dir:
+        return []
+
+    image_files = []
+    try:
+        with os.scandir(normalized_dir) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS):
+                    image_files.append(entry.path)
+    except OSError as e:
+        raise OSError(f"读取目录失败: {normalized_dir}，原因: {str(e)}") from e
+
+    return image_files
+
+
+def resolve_keyframe_directory(path_value):
+    """规范化并校验关键帧目录，返回目录、图片列表和错误信息。"""
+    normalized_dir = normalize_user_path(path_value)
+    if not normalized_dir:
+        return "", [], "关键帧路径为空"
+
+    if not os.path.exists(normalized_dir):
+        return normalized_dir, [], "关键帧路径不存在"
+
+    if not os.path.isdir(normalized_dir):
+        return normalized_dir, [], "关键帧路径不是文件夹"
+
+    try:
+        image_files = list_image_files(normalized_dir)
+    except OSError as e:
+        return normalized_dir, [], str(e)
+
+    if not image_files:
+        return normalized_dir, [], "关键帧文件夹中没有图片文件"
+
+    return normalized_dir, image_files, ""
+
+
 # --- 全局声明和配置 ---
 # 使用session_state保存状态
-if 'selected_model' not in st.session_state:
+if "selected_model" not in st.session_state:
     st.session_state.selected_model = None
-if 'client' not in st.session_state:
+if "client" not in st.session_state:
     st.session_state.client = None
-if 'video_path' not in st.session_state:
+if "video_path" not in st.session_state:
     st.session_state.video_path = None
-if 'keyframe_dir' not in st.session_state:
-    if getattr(sys, 'frozen', False):
-        program_dir = os.path.dirname(sys.executable)
-    else:
-        program_dir = os.path.dirname(os.path.abspath(__file__))
-    st.session_state.keyframe_dir = os.path.join(program_dir, "keyframes")
-if 'output_file' not in st.session_state:
-    if getattr(sys, 'frozen', False):
+if "keyframe_dir" not in st.session_state:
+    st.session_state.keyframe_dir = DEFAULT_KEYFRAME_DIR
+if "output_file" not in st.session_state:
+    if getattr(sys, "frozen", False):
         program_dir = os.path.dirname(sys.executable)
     else:
         program_dir = os.path.dirname(os.path.abspath(__file__))
     st.session_state.output_file = os.path.join(program_dir, "草稿.txt")
-if 'processing' not in st.session_state:
+if "processing" not in st.session_state:
     st.session_state.processing = False
-if 'progress_bar' not in st.session_state:
+if "progress_bar" not in st.session_state:
     st.session_state.progress_bar = None
-if 'api_key' not in st.session_state:
+if "api_key" not in st.session_state:
     st.session_state.api_key = None
-if 'use_ollama' not in st.session_state:
+if "use_ollama" not in st.session_state:
     st.session_state.use_ollama = False
-if 'ollama_models' not in st.session_state:
+if "ollama_models" not in st.session_state:
     st.session_state.ollama_models = []  # 存储Ollama模型列表
-if 'ollama_used' not in st.session_state:
+if "ollama_used" not in st.session_state:
     st.session_state.ollama_used = False  # 标记是否使用了Ollama模型
-if 'show_stop_button' not in st.session_state:
+if "show_stop_button" not in st.session_state:
     st.session_state.show_stop_button = False  # 控制停止按钮显示
-if 'user_custom_prompt' not in st.session_state:
+if "user_custom_prompt" not in st.session_state:
     st.session_state.user_custom_prompt = ""  # 用户自定义提示词
-if 'funasr_model' not in st.session_state:
+if "funasr_model" not in st.session_state:
     st.session_state.funasr_model = None  # FunASR模型实例
-if 'vector_store' not in st.session_state:
+if "vector_store" not in st.session_state:
     st.session_state.vector_store = None  # 向量数据库
-if 'cache_dir' not in st.session_state:
-    if getattr(sys, 'frozen', False):
+if "cache_dir" not in st.session_state:
+    if getattr(sys, "frozen", False):
         program_dir = os.path.dirname(sys.executable)
     else:
         program_dir = os.path.dirname(os.path.abspath(__file__))
     st.session_state.cache_dir = os.path.join(program_dir, "cache")  # 缓存目录
-if 'current_page' not in st.session_state:
+if "current_page" not in st.session_state:
     st.session_state.current_page = "视频分析"  # 当前页面
-if 'concurrent_queue' not in st.session_state:
+if "concurrent_queue" not in st.session_state:
     st.session_state.concurrent_queue = asyncio.Queue()  # 并发队列
-if 'query_history' not in st.session_state:
+if "query_history" not in st.session_state:
     st.session_state.query_history = []
-if 'use_existing_keyframes' not in st.session_state:
+if "use_existing_keyframes" not in st.session_state:
     st.session_state.use_existing_keyframes = False
-if 'existing_keyframes_path' not in st.session_state:
+if "existing_keyframes_path" not in st.session_state:
     st.session_state.existing_keyframes_path = ""
-if 'use_existing_vector_db' not in st.session_state:
+if "use_existing_vector_db" not in st.session_state:
     st.session_state.use_existing_vector_db = False
-if 'existing_vector_db_path' not in st.session_state:
+if "existing_vector_db_path" not in st.session_state:
     st.session_state.existing_vector_db_path = ""  # RAG查询历史
-if 'force_reparse_keyframes' not in st.session_state:
+if "force_reparse_keyframes" not in st.session_state:
     st.session_state.force_reparse_keyframes = False  # 强制重新解析关键帧
-if 'vector_store_path' not in st.session_state:
-    if getattr(sys, 'frozen', False):
+if "vector_store_path" not in st.session_state:
+    if getattr(sys, "frozen", False):
         program_dir = os.path.dirname(sys.executable)
     else:
         program_dir = os.path.dirname(os.path.abspath(__file__))
-    st.session_state.vector_store_path = os.path.join(program_dir, "chroma_db")  # 向量数据库路径
-if 'embedding_model' not in st.session_state:
+    st.session_state.vector_store_path = os.path.join(
+        program_dir, "chroma_db"
+    )  # 向量数据库路径
+if "embedding_model" not in st.session_state:
     st.session_state.embedding_model = None  # Embedding模型实例
-if 'vlm_model' not in st.session_state:
+if "vlm_model" not in st.session_state:
     st.session_state.vlm_model = "qwen-vl-plus"  # 视觉语言模型
-if 'llm_model' not in st.session_state:
+if "llm_model" not in st.session_state:
     st.session_state.llm_model = "qwen-plus"  # 纯文本模型
-if 'llm_use_ollama' not in st.session_state:
+if "llm_use_ollama" not in st.session_state:
     st.session_state.llm_use_ollama = False  # 多方式分析页面独立的Ollama标志
-if 'llm_ollama_model' not in st.session_state:
+if "llm_ollama_model" not in st.session_state:
     st.session_state.llm_ollama_model = None  # 多方式分析页面的Ollama模型
-if 'token_usage' not in st.session_state:
+if "token_usage" not in st.session_state:
     st.session_state.token_usage = {
-        'input_tokens': 0,
-        'output_tokens': 0,
-        'total_cost': 0.0
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_cost": 0.0,
     }  # Token使用统计
+
 
 # --- Token计费模块 ---
 def calculate_token_cost(input_tokens, output_tokens):
     """
     根据阶梯价格计算Token费用
-    
+
     阶梯价格（每千Token）：
     输入Token：0-32K: ¥0.001, 32K-128K: ¥0.0015, 128K-256K: ¥0.003
     输出Token：0-32K: ¥0.01, 32K-128K: ¥0.015, 128K-256K: ¥0.03
     """
+
     def calculate_tiered_cost(tokens, price_tiers):
         """计算阶梯价格"""
         cost = 0.0
         remaining = tokens
-        
+
         for (tier_start, tier_end), price_per_k in price_tiers:
             if remaining <= 0:
                 break
-            
+
             tier_size = tier_end - tier_start if tier_end else remaining
             tokens_in_tier = min(remaining, tier_size)
             cost += (tokens_in_tier / 1000) * price_per_k
             remaining -= tokens_in_tier
-        
+
         return cost
-    
+
     # 输入Token价格阶梯（起始Token数，结束Token数）：每千Token价格
     input_tiers = [
         ((0, 32000), 0.001),
         ((32000, 128000), 0.0015),
-        ((128000, 256000), 0.003)
+        ((128000, 256000), 0.003),
     ]
-    
+
     # 输出Token价格阶梯
     output_tiers = [
         ((0, 32000), 0.01),
         ((32000, 128000), 0.015),
-        ((128000, 256000), 0.03)
+        ((128000, 256000), 0.03),
     ]
-    
+
     input_cost = calculate_tiered_cost(input_tokens, input_tiers)
     output_cost = calculate_tiered_cost(output_tokens, output_tiers)
-    
+
     return {
-        'input_cost': input_cost,
-        'output_cost': output_cost,
-        'total_cost': input_cost + output_cost
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": input_cost + output_cost,
     }
+
 
 def reset_token_usage():
     """重置Token使用统计"""
     st.session_state.token_usage = {
-        'input_tokens': 0,
-        'output_tokens': 0,
-        'total_cost': 0.0
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_cost": 0.0,
     }
+
 
 def update_token_usage(input_tokens, output_tokens):
     """更新Token使用统计"""
-    st.session_state.token_usage['input_tokens'] += input_tokens
-    st.session_state.token_usage['output_tokens'] += output_tokens
-    
+    st.session_state.token_usage["input_tokens"] += input_tokens
+    st.session_state.token_usage["output_tokens"] += output_tokens
+
     # 重新计算总费用
     cost_info = calculate_token_cost(
-        st.session_state.token_usage['input_tokens'],
-        st.session_state.token_usage['output_tokens']
+        st.session_state.token_usage["input_tokens"],
+        st.session_state.token_usage["output_tokens"],
     )
-    st.session_state.token_usage['total_cost'] = cost_info['total_cost']
+    st.session_state.token_usage["total_cost"] = cost_info["total_cost"]
+
 
 def display_token_usage(container=None):
     """显示Token使用统计和费用
-    
+
     Args:
         container: Streamlit容器对象，用于实时更新显示。如果为None，则在当前位置显示
     """
     usage = st.session_state.token_usage
-    
-    if usage['input_tokens'] == 0 and usage['output_tokens'] == 0:
+
+    if usage["input_tokens"] == 0 and usage["output_tokens"] == 0:
         return None
-    
+
     # 如果提供了容器，在容器中显示；否则在当前位置显示
     display_context = container if container else st
-    
+
     with display_context:
         st.markdown("---")
         st.markdown("### 💰 用量统计与费用")
-        
+
         # 创建三列显示统计信息
         col1, col2, col3 = st.columns(3)
-        
+
         with col1:
             st.metric(
                 label="输入 Token",
                 value=f"{usage['input_tokens']:,}",
-                help="包括图片编码和文本输入的Token数"
+                help="包括图片编码和文本输入的Token数",
             )
-        
+
         with col2:
             st.metric(
                 label="输出 Token",
                 value=f"{usage['output_tokens']:,}",
-                help="模型生成的文本Token数"
+                help="模型生成的文本Token数",
             )
-        
+
         with col3:
             st.metric(
                 label="预估总费用",
                 value=f"¥{usage['total_cost']:.4f}",
-                help="基于阶梯价格计算的预估费用"
+                help="基于阶梯价格计算的预估费用",
             )
-    
+
     # 详细费用分解
     with st.expander("📊 费用详细分解", expanded=False):
-        cost_breakdown = calculate_token_cost(usage['input_tokens'], usage['output_tokens'])
-        
+        cost_breakdown = calculate_token_cost(
+            usage["input_tokens"], usage["output_tokens"]
+        )
+
         st.markdown(f"""
-        **输入Token费用：** ¥{cost_breakdown['input_cost']:.4f}
-        - Token数：{usage['input_tokens']:,}
+        **输入Token费用：** ¥{cost_breakdown["input_cost"]:.4f}
+        - Token数：{usage["input_tokens"]:,}
         
-        **输出Token费用：** ¥{cost_breakdown['output_cost']:.4f}
-        - Token数：{usage['output_tokens']:,}
+        **输出Token费用：** ¥{cost_breakdown["output_cost"]:.4f}
+        - Token数：{usage["output_tokens"]:,}
         
-        **总计：** ¥{cost_breakdown['total_cost']:.4f}
+        **总计：** ¥{cost_breakdown["total_cost"]:.4f}
         
         ---
         
@@ -303,6 +388,7 @@ def display_token_usage(container=None):
         - 费用为预估值，实际费用以阿里云账单为准
         - 免费额度：输入和输出各100万Token（90天有效期）
         """)
+
 
 # --- 免责声明模块 ---
 def show_disclaimer():
@@ -353,6 +439,7 @@ def show_disclaimer():
 """
     st.warning(disclaimer)
 
+
 def show_important_reminder():
     with st.title("重要提示"):
         st.info("""
@@ -365,7 +452,6 @@ def show_important_reminder():
         4. 边栏与提示区的空间占比可以调节，将鼠标指针移动至边栏与提示区交界处以调节
         5. 如果您需要更改您的API密钥，请手动更改，如您不知道如何更改，请询问神奇的度娘
         """)
-        
 
 
 # --- 操作流程说明模块 ---
@@ -399,55 +485,62 @@ def show_operation_guide():
 def check_ffmpeg():
     """
     检查FFmpeg是否可用，优先使用项目内置的FFmpeg
-    
+
     返回:
         bool: FFmpeg是否可用
         str: 可用的FFmpeg路径
     """
     # 项目内置FFmpeg路径
-    builtin_ffmpeg_path = os.path.join(os.path.dirname(__file__), 'ffmpeg_downlaod', 'bin', 'ffmpeg.exe')
-    
+    builtin_ffmpeg_path = os.path.join(
+        os.path.dirname(__file__), "ffmpeg_downlaod", "bin", "ffmpeg.exe"
+    )
+
     # 首先检查项目内置的FFmpeg
     if os.path.exists(builtin_ffmpeg_path):
         try:
-            subprocess.run([builtin_ffmpeg_path, '-version'], 
-                           stdout=subprocess.DEVNULL, 
-                           stderr=subprocess.DEVNULL, 
-                           check=True)
+            subprocess.run(
+                [builtin_ffmpeg_path, "-version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
             st.info(f"✅ 使用项目内置FFmpeg: {builtin_ffmpeg_path}")
             return True, builtin_ffmpeg_path
         except:
             st.warning(f"⚠️ 项目内置FFmpeg不可用: {builtin_ffmpeg_path}")
-    
+
     # 如果项目内置FFmpeg不可用，检查系统PATH中的FFmpeg
     try:
-        subprocess.run(['ffmpeg', '-version'], 
-                       stdout=subprocess.DEVNULL, 
-                       stderr=subprocess.DEVNULL, 
-                       check=True)
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
         st.info("✅ 使用系统PATH中的FFmpeg")
-        return True, 'ffmpeg'
+        return True, "ffmpeg"
     except:
         st.error("❌ 未找到可用的FFmpeg，请确保FFmpeg已安装并添加到系统PATH")
         return False, None
+
 
 # --- 获取Ollama模型列表 ---
 def get_ollama_models():
     """
     获取可用的Ollama模型列表
-    
+
     注意：新版本的Ollama API必须使用Client实例，不能直接调用ollama.list()
     """
     try:
         # 新版本必须使用Client实例
         client = Client(host="http://localhost:11434")
         response = client.list()
-        
+
         # 安全地获取模型列表，优先使用model属性，如果不存在则使用name属性
         models_list = []
-        for model in response.get('models', []):
+        for model in response.get("models", []):
             # 新版本使用model属性，旧版本使用name属性
-            model_name = model.get('model') or model.get('name')
+            model_name = model.get("model") or model.get("name")
             if model_name:
                 models_list.append(model_name)
         return models_list
@@ -455,13 +548,12 @@ def get_ollama_models():
         st.error(f"""无法获取Ollama模型列表: {e}""")
         # 尝试直接调用命令行作为备用方案
         try:
-            result = subprocess.run(['ollama', 'list'], 
-                                  capture_output=True, 
-                                  text=True, 
-                                  check=True)
-            lines = result.stdout.strip().split('\n')
+            result = subprocess.run(
+                ["ollama", "list"], capture_output=True, text=True, check=True
+            )
+            lines = result.stdout.strip().split("\n")
             models = []
-            if lines and lines[0].startswith('NAME'):
+            if lines and lines[0].startswith("NAME"):
                 for line in lines[1:]:
                     parts = line.split()
                     if parts:
@@ -470,6 +562,7 @@ def get_ollama_models():
         except Exception as e2:
             st.error(f"调用 'ollama list' 命令也失败了: {e2}")
             return []
+
 
 # --- 模型选择和初始化模块 ---
 def init_model():
@@ -488,7 +581,7 @@ def init_model():
             if not st.session_state.api_key:
                 st.error("请先在环境变量中设置 DASHSCOPE_API_KEY")
                 return False
-            
+
             # 初始化阿里云客户端
             st.session_state.client = OpenAI(
                 api_key=st.session_state.api_key,
@@ -503,15 +596,16 @@ def init_model():
         st.error(f"模型初始化失败: {str(e)}")
         return False
 
+
 # --- 智能抽帧模块 (pyscenedetect) ---
 def extract_keyframes_pyscenedetect(video_path, output_dir):
     """
     使用pyscenedetect进行智能场景检测和关键帧提取
-    
+
     参数:
         video_path (str): 视频文件路径
         output_dir (str): 关键帧输出目录
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
@@ -546,23 +640,27 @@ def extract_keyframes_pyscenedetect(video_path, output_dir):
             # 获取场景的开始和结束帧
             start_frame = scene[0].get_frames()
             end_frame = scene[1].get_frames()
-            
+
             # 选择场景中间帧作为关键帧
             middle_frame = (start_frame + end_frame) // 2
-            
+
             # 预先确定输出文件名，使用场景索引确保序列化
-            scene_info_list.append({
-                'scene_index': i,                    # 场景索引，用于保持序列
-                'start_frame': start_frame,          # 场景开始帧
-                'end_frame': end_frame,              # 场景结束帧
-                'middle_frame': middle_frame,        # 场景中间帧（关键帧位置）
-                'output_file': os.path.join(output_dir, f"{i:04d}.png")  # 固定文件名，避免并行冲突
-            })
+            scene_info_list.append(
+                {
+                    "scene_index": i,  # 场景索引，用于保持序列
+                    "start_frame": start_frame,  # 场景开始帧
+                    "end_frame": end_frame,  # 场景结束帧
+                    "middle_frame": middle_frame,  # 场景中间帧（关键帧位置）
+                    "output_file": os.path.join(
+                        output_dir, f"{i:04d}.png"
+                    ),  # 固定文件名，避免并行冲突
+                }
+            )
 
         # 使用批量处理提取关键帧（优化版，速度更快）
         try:
             keyframe_count = extract_keyframes_batch(video_path, scene_info_list)
-            
+
             # 检查是否成功提取了足够的关键帧
             if keyframe_count > 0:
                 print(f"[抽帧] ✅ 关键帧提取完成! 共提取 {keyframe_count} 个关键帧")
@@ -583,63 +681,66 @@ def extract_keyframes_pyscenedetect(video_path, output_dir):
         print("[抽帧] 回退到传统关键帧提取方法...")
         return extract_keyframes_traditional(video_path, output_dir)
 
+
 # --- 批量关键帧提取模块 (优化版) ---
 def extract_keyframes_batch(video_path, scene_info_list):
     """
     批量提取关键帧 - 优化版本
-    
+
     核心优化思路：
     1. 先完成场景检测，确定所有需要提取的帧号
     2. 使用OpenCV一次性遍历视频，在对应帧号处保存
     3. 避免多次调用FFmpeg，大幅提升速度
-    
+
     参数:
         video_path (str): 视频文件路径
         scene_info_list (list): 场景信息列表，包含每个场景的帧信息和输出路径
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
     if not scene_info_list:
         return 0
-    
+
     print(f"[抽帧] 🚀 准备批量提取 {len(scene_info_list)} 个关键帧...")
-    
+
     try:
         # 构建帧号到输出文件的映射（使用字典快速查找）
         frame_to_output = {}
         for scene_info in scene_info_list:
-            frame_num = scene_info['middle_frame']
-            output_file = scene_info['output_file']
+            frame_num = scene_info["middle_frame"]
+            output_file = scene_info["output_file"]
             frame_to_output[frame_num] = output_file
-        
+
         # 获取所有需要提取的帧号（排序后可以顺序读取）
         target_frames = sorted(frame_to_output.keys())
-        
+
         print(f"[抽帧] 📋 场景检测完成，确定了 {len(target_frames)} 个关键帧位置")
-        
+
         # 打开视频
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"[抽帧] ❌ 无法打开视频文件: {video_path}")
             return 0
-        
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        
+
         print(f"[抽帧] 📹 视频信息: 总帧数 {total_frames}, FPS {fps:.2f}")
-        print(f"[抽帧] 🎯 需要提取的帧号: {target_frames[:5]}{'...' if len(target_frames) > 5 else ''}")
+        print(
+            f"[抽帧] 🎯 需要提取的帧号: {target_frames[:5]}{'...' if len(target_frames) > 5 else ''}"
+        )
         print(f"[抽帧] ⏳ 正在批量提取关键帧...")
-        
+
         # 提取关键帧
         successful_count = 0
-        
+
         # 使用更简单可靠的方法：直接对每个目标帧进行跳转和读取
         for idx, target_frame in enumerate(target_frames):
             try:
                 # 直接跳转到目标帧
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                
+
                 # 验证跳转是否成功（有些视频格式seek不准确）
                 actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 if abs(actual_pos - target_frame) > 5:
@@ -649,36 +750,38 @@ def extract_keyframes_batch(video_path, scene_info_list):
                         ret = cap.grab()
                         if not ret:
                             break
-                
+
                 # 读取该帧
                 ret, frame = cap.read()
-                
+
                 # 调试信息
                 if idx == 0:
-                    print(f"[抽帧-调试] 第1帧 - ret={ret}, frame is None={frame is None}")
+                    print(
+                        f"[抽帧-调试] 第1帧 - ret={ret}, frame is None={frame is None}"
+                    )
                     if frame is not None:
                         print(f"[抽帧-调试] 第1帧 - frame.shape={frame.shape}")
-                
+
                 if ret and frame is not None:
                     output_file = frame_to_output[target_frame]
-                    
+
                     # 调试输出路径
                     if idx == 0:
                         print(f"[抽帧-调试] 输出路径: {output_file}")
                         print(f"[抽帧-调试] 输出目录: {os.path.dirname(output_file)}")
-                    
+
                     # 确保输出目录存在
                     output_dir = os.path.dirname(output_file)
                     if output_dir:  # 如果有目录部分
                         os.makedirs(output_dir, exist_ok=True)
-                    
+
                     # 使用 cv2.imencode + 手动写入来支持中文路径
                     try:
                         # 将图像编码为PNG格式
-                        success, encoded_img = cv2.imencode('.png', frame)
+                        success, encoded_img = cv2.imencode(".png", frame)
                         if success:
                             # 手动写入文件（支持中文路径）
-                            with open(output_file, 'wb') as f:
+                            with open(output_file, "wb") as f:
                                 f.write(encoded_img.tobytes())
                             success = True
                         else:
@@ -686,7 +789,7 @@ def extract_keyframes_batch(video_path, scene_info_list):
                     except Exception as e:
                         print(f"[抽帧] 保存失败: {str(e)}")
                         success = False
-                    
+
                     if success and os.path.exists(output_file):
                         # 验证文件确实被创建且有内容
                         file_size = os.path.getsize(output_file)
@@ -694,78 +797,90 @@ def extract_keyframes_batch(video_path, scene_info_list):
                             successful_count += 1
                             # 第一帧和每10帧显示一次进度
                             if successful_count == 1:
-                                print(f"[抽帧] ✅ 第一帧提取成功！文件: {output_file}, 大小: {file_size} bytes")
+                                print(
+                                    f"[抽帧] ✅ 第一帧提取成功！文件: {output_file}, 大小: {file_size} bytes"
+                                )
                             elif successful_count % 10 == 0:
-                                print(f"[抽帧] ⏳ 已提取: {successful_count}/{len(target_frames)}")
+                                print(
+                                    f"[抽帧] ⏳ 已提取: {successful_count}/{len(target_frames)}"
+                                )
                         else:
                             print(f"[抽帧] ⚠️ 保存的文件 {output_file} 大小为0")
                     else:
-                        print(f"[抽帧] ⚠️ cv2.imwrite返回: {success}, 文件存在: {os.path.exists(output_file)}")
+                        print(
+                            f"[抽帧] ⚠️ cv2.imwrite返回: {success}, 文件存在: {os.path.exists(output_file)}"
+                        )
                 else:
                     print(f"[抽帧] ⚠️ 读取帧 {target_frame} 失败")
-                
+
             except Exception as e:
                 print(f"[抽帧] ⚠️ 处理帧 {target_frame} 时出错: {str(e)}")
-        
+
         cap.release()
-        
-        print(f"[抽帧] ✅ 批量提取完成！成功提取 {successful_count}/{len(target_frames)} 个关键帧")
+
+        print(
+            f"[抽帧] ✅ 批量提取完成！成功提取 {successful_count}/{len(target_frames)} 个关键帧"
+        )
         return successful_count
-        
+
     except Exception as e:
         print(f"[抽帧] ❌ 批量提取关键帧时出错: {str(e)}")
         import traceback
+
         print(f"[抽帧] 详细错误: {traceback.format_exc()}")
-        
+
         return 0
+
 
 # --- 并行关键帧提取模块 (保留作为备用) ---
 def extract_keyframes_parallel(video_path, scene_info_list):
     """
     并行提取关键帧，保持序列化（备用方案）
-    
+
     核心设计原则：
     1. 预先确定文件名，避免并行写入冲突
     2. 使用线程安全计数器更新进度
     3. 限制并发数，避免资源竞争
     4. 保持帧的序列化顺序
-    
+
     参数:
         video_path (str): 视频文件路径
         scene_info_list (list): 场景信息列表，包含每个场景的帧信息和输出路径
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
     import concurrent.futures
     import threading
-    
+
     # 线程安全的计数器，用于进度更新
     completed_count = 0
     lock = threading.Lock()
-    
+
     def update_progress():
         """线程安全的进度更新函数"""
         nonlocal completed_count
         with lock:
             completed_count += 1
             if completed_count % 10 == 0:
-                print(f"[抽帧-并行] ⏳ 已完成: {completed_count}/{len(scene_info_list)}")
-    
+                print(
+                    f"[抽帧-并行] ⏳ 已完成: {completed_count}/{len(scene_info_list)}"
+                )
+
     def extract_single_frame(scene_info):
         """
         提取单个场景的关键帧（使用OpenCV）
-        
+
         参数:
             scene_info (dict): 场景信息字典
-            
+
         返回:
             bool: 提取是否成功
         """
-        scene_index = scene_info['scene_index']
-        middle_frame = scene_info['middle_frame']
-        output_file = scene_info['output_file']
-        
+        scene_index = scene_info["scene_index"]
+        middle_frame = scene_info["middle_frame"]
+        output_file = scene_info["output_file"]
+
         # 使用OpenCV提取关键帧（不再使用FFmpeg）
         try:
             # 打开视频
@@ -773,58 +888,66 @@ def extract_keyframes_parallel(video_path, scene_info_list):
             if not cap.isOpened():
                 update_progress()
                 return False
-            
+
             # 跳转到目标帧
             cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-            
+
             # 读取帧
             ret, frame = cap.read()
-            
+
             if ret and frame is not None:
                 # 确保输出目录存在
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                
+
                 # 使用 cv2.imencode + 手动写入来支持中文路径
                 try:
-                    success, encoded_img = cv2.imencode('.png', frame)
+                    success, encoded_img = cv2.imencode(".png", frame)
                     if success:
-                        with open(output_file, 'wb') as f:
+                        with open(output_file, "wb") as f:
                             f.write(encoded_img.tobytes())
                         success = True
                     else:
                         success = False
                 except:
                     success = False
-                
+
                 # 验证文件
-                if success and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                if (
+                    success
+                    and os.path.exists(output_file)
+                    and os.path.getsize(output_file) > 0
+                ):
                     cap.release()
                     update_progress()
                     return True
-            
+
             cap.release()
             update_progress()
             return False
-            
+
         except Exception as e:
             # 任何异常都返回False
             update_progress()
             return False
-    
+
     # 使用线程池并行处理（使用OpenCV）
     # 限制最大并发数为4，避免过多并发导致的资源竞争
     max_workers = min(4, len(scene_info_list))
     successful_count = 0
-    
+
     # 显示初始状态
-    print(f"[抽帧-并行] 准备并行提取 {len(scene_info_list)} 个场景的关键帧（使用OpenCV）...")
-    
+    print(
+        f"[抽帧-并行] 准备并行提取 {len(scene_info_list)} 个场景的关键帧（使用OpenCV）..."
+    )
+
     # 使用线程池执行器进行并行处理
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有提取任务到线程池
-        future_to_scene = {executor.submit(extract_single_frame, scene_info): scene_info 
-                          for scene_info in scene_info_list}
-        
+        future_to_scene = {
+            executor.submit(extract_single_frame, scene_info): scene_info
+            for scene_info in scene_info_list
+        }
+
         # 收集处理结果，确保所有任务完成
         for future in concurrent.futures.as_completed(future_to_scene):
             scene_info = future_to_scene[future]
@@ -834,10 +957,15 @@ def extract_keyframes_parallel(video_path, scene_info_list):
                     successful_count += 1
             except Exception as e:
                 # 记录失败信息
-                print(f"[抽帧-并行] ⚠️ 提取场景 {scene_info['scene_index']+1} 关键帧失败: {str(e)}")
-    
-    print(f"[抽帧-并行] ✅ 并行提取完成！成功提取 {successful_count}/{len(scene_info_list)} 个关键帧")
+                print(
+                    f"[抽帧-并行] ⚠️ 提取场景 {scene_info['scene_index'] + 1} 关键帧失败: {str(e)}"
+                )
+
+    print(
+        f"[抽帧-并行] ✅ 并行提取完成！成功提取 {successful_count}/{len(scene_info_list)} 个关键帧"
+    )
     return successful_count
+
 
 # --- 传统关键帧提取方法 (备用) ---
 def extract_keyframes_traditional(video_path, output_dir):
@@ -870,14 +998,14 @@ def extract_keyframes_traditional(video_path, output_dir):
             output_file = os.path.join(output_dir, f"{keyframe_count:04d}.png")
             # 使用 cv2.imencode + 手动写入来支持中文路径
             try:
-                success, encoded_img = cv2.imencode('.png', frame)
+                success, encoded_img = cv2.imencode(".png", frame)
                 if success:
-                    with open(output_file, 'wb') as f:
+                    with open(output_file, "wb") as f:
                         f.write(encoded_img.tobytes())
                     keyframe_count += 1
             except Exception as e:
                 print(f"[抽帧-传统] 保存失败: {str(e)}")
-            
+
             if keyframe_count % 10 == 0:
                 print(f"[抽帧-传统] ⏳ 已提取: {keyframe_count}")
 
@@ -886,9 +1014,10 @@ def extract_keyframes_traditional(video_path, output_dir):
     print(f"[抽帧-传统] ✅ 传统方法提取完成! 共提取 {keyframe_count} 个关键帧")
     return keyframe_count
 
+
 def extract_keyframes(video_path, output_dir):
     """关键帧提取主函数 - 优先使用pyscenedetect
-    
+
     参数:
         video_path: 视频文件路径
         output_dir: 关键帧输出目录
@@ -898,12 +1027,12 @@ def extract_keyframes(video_path, output_dir):
 
 def extract_keyframes_with_heartbeat(video_path, output_dir, heartbeat_result):
     """带心跳监控的关键帧提取函数
-    
+
     参数:
         video_path: 视频文件路径
         output_dir: 关键帧输出目录
         heartbeat_result: 心跳监控结果字典，用于更新心跳状态
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
@@ -916,7 +1045,7 @@ def extract_keyframes_with_heartbeat(video_path, output_dir, heartbeat_result):
         # 发送初始心跳
         heartbeat_result["last_heartbeat"] = time.time()
         heartbeat_result["heartbeat_count"] = 0
-        
+
         # 使用新的API打开视频
         video = open_video(video_path)
         scene_manager = SceneManager()
@@ -927,7 +1056,9 @@ def extract_keyframes_with_heartbeat(video_path, output_dir, heartbeat_result):
         # 发送场景检测开始心跳
         heartbeat_result["last_heartbeat"] = time.time()
         heartbeat_result["heartbeat_count"] += 1
-        print(f"[抽帧-心跳] 场景检测开始，心跳计数: {heartbeat_result['heartbeat_count']}")
+        print(
+            f"[抽帧-心跳] 场景检测开始，心跳计数: {heartbeat_result['heartbeat_count']}"
+        )
 
         # 开始场景检测
         scene_manager.detect_scenes(video=video)
@@ -943,7 +1074,9 @@ def extract_keyframes_with_heartbeat(video_path, output_dir, heartbeat_result):
         # 发送场景检测完成心跳
         heartbeat_result["last_heartbeat"] = time.time()
         heartbeat_result["heartbeat_count"] += 1
-        print(f"[抽帧-心跳] 场景检测完成，心跳计数: {heartbeat_result['heartbeat_count']}")
+        print(
+            f"[抽帧-心跳] 场景检测完成，心跳计数: {heartbeat_result['heartbeat_count']}"
+        )
 
         # 创建场景信息列表，保持序列化
         scene_info_list = []
@@ -951,34 +1084,44 @@ def extract_keyframes_with_heartbeat(video_path, output_dir, heartbeat_result):
             # 获取场景的开始和结束帧
             start_frame = scene[0].get_frames()
             end_frame = scene[1].get_frames()
-            
+
             # 选择场景中间帧作为关键帧
             middle_frame = (start_frame + end_frame) // 2
 
             # 预先确定输出文件名，使用场景索引确保序列化
-            scene_info_list.append({
-                'scene_index': i,                    # 场景索引，用于保持序列
-                'start_frame': start_frame,          # 场景开始帧
-                'end_frame': end_frame,              # 场景结束帧
-                'middle_frame': middle_frame,        # 场景中间帧（关键帧位置）
-                'output_file': os.path.join(output_dir, f"{i:04d}.png")  # 固定文件名，避免并行冲突
-            })
+            scene_info_list.append(
+                {
+                    "scene_index": i,  # 场景索引，用于保持序列
+                    "start_frame": start_frame,  # 场景开始帧
+                    "end_frame": end_frame,  # 场景结束帧
+                    "middle_frame": middle_frame,  # 场景中间帧（关键帧位置）
+                    "output_file": os.path.join(
+                        output_dir, f"{i:04d}.png"
+                    ),  # 固定文件名，避免并行冲突
+                }
+            )
 
         # 使用批量处理提取关键帧（优化版，速度更快）
         try:
             # 发送批量提取开始心跳
             heartbeat_result["last_heartbeat"] = time.time()
             heartbeat_result["heartbeat_count"] += 1
-            print(f"[抽帧-心跳] 批量提取开始，心跳计数: {heartbeat_result['heartbeat_count']}")
-            
-            keyframe_count = extract_keyframes_batch_with_heartbeat(video_path, scene_info_list, heartbeat_result)
-            
+            print(
+                f"[抽帧-心跳] 批量提取开始，心跳计数: {heartbeat_result['heartbeat_count']}"
+            )
+
+            keyframe_count = extract_keyframes_batch_with_heartbeat(
+                video_path, scene_info_list, heartbeat_result
+            )
+
             # 检查是否成功提取了足够的关键帧
             if keyframe_count > 0:
                 # 发送完成心跳
                 heartbeat_result["last_heartbeat"] = time.time()
                 heartbeat_result["heartbeat_count"] += 1
-                print(f"[抽帧-心跳] ✅ 关键帧提取完成! 共提取 {keyframe_count} 个关键帧，总心跳: {heartbeat_result['heartbeat_count']}")
+                print(
+                    f"[抽帧-心跳] ✅ 关键帧提取完成! 共提取 {keyframe_count} 个关键帧，总心跳: {heartbeat_result['heartbeat_count']}"
+                )
                 return keyframe_count
             else:
                 print("[抽帧-心跳] ⚠️ 批量提取未成功，尝试使用备用方法...")
@@ -986,93 +1129,105 @@ def extract_keyframes_with_heartbeat(video_path, output_dir, heartbeat_result):
         except Exception as e:
             print(f"[抽帧-心跳] 批量提取方法出错: {str(e)}")
             print("[抽帧-心跳] 🔄 正在使用并行提取方法（备用方案）...")
-            
+
             # 发送备用方法开始心跳
             heartbeat_result["last_heartbeat"] = time.time()
             heartbeat_result["heartbeat_count"] += 1
-            
-            keyframe_count = extract_keyframes_parallel_with_heartbeat(video_path, scene_info_list, heartbeat_result)
-            
+
+            keyframe_count = extract_keyframes_parallel_with_heartbeat(
+                video_path, scene_info_list, heartbeat_result
+            )
+
             # 发送备用方法完成心跳
             heartbeat_result["last_heartbeat"] = time.time()
             heartbeat_result["heartbeat_count"] += 1
-            
-            print(f"[抽帧-心跳] ✅ 关键帧提取完成! 共提取 {keyframe_count} 个关键帧，总心跳: {heartbeat_result['heartbeat_count']}")
+
+            print(
+                f"[抽帧-心跳] ✅ 关键帧提取完成! 共提取 {keyframe_count} 个关键帧，总心跳: {heartbeat_result['heartbeat_count']}"
+            )
             return keyframe_count
 
     except Exception as e:
         print(f"[抽帧-心跳] pyscenedetect场景检测失败: {e}")
         # 回退到原来的方法
         print("[抽帧-心跳] 回退到传统关键帧提取方法...")
-        
+
         # 发送传统方法开始心跳
         heartbeat_result["last_heartbeat"] = time.time()
         heartbeat_result["heartbeat_count"] += 1
-        
-        keyframe_count = extract_keyframes_traditional_with_heartbeat(video_path, output_dir, heartbeat_result)
-        
+
+        keyframe_count = extract_keyframes_traditional_with_heartbeat(
+            video_path, output_dir, heartbeat_result
+        )
+
         # 发送传统方法完成心跳
         heartbeat_result["last_heartbeat"] = time.time()
         heartbeat_result["heartbeat_count"] += 1
-        
+
         return keyframe_count
 
 
-def extract_keyframes_batch_with_heartbeat(video_path, scene_info_list, heartbeat_result):
+def extract_keyframes_batch_with_heartbeat(
+    video_path, scene_info_list, heartbeat_result
+):
     """带心跳监控的批量关键帧提取函数
-    
+
     参数:
         video_path (str): 视频文件路径
         scene_info_list (list): 场景信息列表
         heartbeat_result: 心跳监控结果字典
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
     if not scene_info_list:
         return 0
-    
+
     print(f"[抽帧-心跳-批量] 准备批量提取 {len(scene_info_list)} 个关键帧...")
-    
+
     try:
         # 构建帧号到输出文件的映射
         frame_to_output = {}
         for scene_info in scene_info_list:
-            frame_num = scene_info['middle_frame']
-            output_file = scene_info['output_file']
+            frame_num = scene_info["middle_frame"]
+            output_file = scene_info["output_file"]
             frame_to_output[frame_num] = output_file
-        
+
         # 获取所有需要提取的帧号（排序后可以顺序读取）
         target_frames = sorted(frame_to_output.keys())
-        
-        print(f"[抽帧-心跳-批量] 场景检测完成，确定了 {len(target_frames)} 个关键帧位置")
-        
+
+        print(
+            f"[抽帧-心跳-批量] 场景检测完成，确定了 {len(target_frames)} 个关键帧位置"
+        )
+
         # 打开视频
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"[抽帧-心跳-批量] ❌ 无法打开视频文件: {video_path}")
             return 0
-        
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        
+
         print(f"[抽帧-心跳-批量] 📹 视频信息: 总帧数 {total_frames}, FPS {fps:.2f}")
         print(f"[抽帧-心跳-批量] ⏳ 正在批量提取关键帧...")
-        
+
         # 提取关键帧
         successful_count = 0
-        
+
         for idx, target_frame in enumerate(target_frames):
             try:
                 # 每处理5帧发送一次心跳
                 if idx % 5 == 0:
                     heartbeat_result["last_heartbeat"] = time.time()
                     heartbeat_result["heartbeat_count"] += 1
-                    print(f"[抽帧-心跳-批量] 处理进度: {idx+1}/{len(target_frames)}，心跳计数: {heartbeat_result['heartbeat_count']}")
-                
+                    print(
+                        f"[抽帧-心跳-批量] 处理进度: {idx + 1}/{len(target_frames)}，心跳计数: {heartbeat_result['heartbeat_count']}"
+                    )
+
                 # 直接跳转到目标帧
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                
+
                 # 验证跳转是否成功
                 actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 if abs(actual_pos - target_frame) > 5:
@@ -1082,23 +1237,23 @@ def extract_keyframes_batch_with_heartbeat(video_path, scene_info_list, heartbea
                         ret = cap.grab()
                         if not ret:
                             break
-                
+
                 # 读取该帧
                 ret, frame = cap.read()
-                
+
                 if ret and frame is not None:
                     output_file = frame_to_output[target_frame]
-                    
+
                     # 确保输出目录存在
                     output_dir = os.path.dirname(output_file)
                     if output_dir:
                         os.makedirs(output_dir, exist_ok=True)
-                    
+
                     # 使用 cv2.imencode + 手动写入来支持中文路径
                     try:
-                        success, encoded_img = cv2.imencode('.png', frame)
+                        success, encoded_img = cv2.imencode(".png", frame)
                         if success:
-                            with open(output_file, 'wb') as f:
+                            with open(output_file, "wb") as f:
                                 f.write(encoded_img.tobytes())
                             success = True
                         else:
@@ -1106,7 +1261,7 @@ def extract_keyframes_batch_with_heartbeat(video_path, scene_info_list, heartbea
                     except Exception as e:
                         print(f"[抽帧-心跳-批量] 保存失败: {str(e)}")
                         success = False
-                    
+
                     if success and os.path.exists(output_file):
                         # 验证文件确实被创建且有内容
                         file_size = os.path.getsize(output_file)
@@ -1114,54 +1269,67 @@ def extract_keyframes_batch_with_heartbeat(video_path, scene_info_list, heartbea
                             successful_count += 1
                             # 第一帧和每10帧显示一次进度
                             if successful_count == 1:
-                                print(f"[抽帧-心跳-批量] ✅ 第一帧提取成功！文件: {output_file}, 大小: {file_size} bytes")
+                                print(
+                                    f"[抽帧-心跳-批量] ✅ 第一帧提取成功！文件: {output_file}, 大小: {file_size} bytes"
+                                )
                             elif successful_count % 10 == 0:
-                                print(f"[抽帧-心跳-批量] ⏳ 已提取: {successful_count}/{len(target_frames)}")
+                                print(
+                                    f"[抽帧-心跳-批量] ⏳ 已提取: {successful_count}/{len(target_frames)}"
+                                )
                         else:
-                            print(f"[抽帧-心跳-批量] ⚠️ 保存的文件 {output_file} 大小为0")
+                            print(
+                                f"[抽帧-心跳-批量] ⚠️ 保存的文件 {output_file} 大小为0"
+                            )
                     else:
-                        print(f"[抽帧-心跳-批量] ⚠️ cv2.imwrite返回: {success}, 文件存在: {os.path.exists(output_file)}")
+                        print(
+                            f"[抽帧-心跳-批量] ⚠️ cv2.imwrite返回: {success}, 文件存在: {os.path.exists(output_file)}"
+                        )
                 else:
                     print(f"[抽帧-心跳-批量] ⚠️ 读取帧 {target_frame} 失败")
-                
+
             except Exception as e:
                 print(f"[抽帧-心跳-批量] ⚠️ 处理帧 {target_frame} 时出错: {str(e)}")
-        
+
         cap.release()
-        
+
         # 发送完成心跳
         heartbeat_result["last_heartbeat"] = time.time()
         heartbeat_result["heartbeat_count"] += 1
-        
-        print(f"[抽帧-心跳-批量] ✅ 批量提取完成！成功提取 {successful_count}/{len(target_frames)} 个关键帧")
+
+        print(
+            f"[抽帧-心跳-批量] ✅ 批量提取完成！成功提取 {successful_count}/{len(target_frames)} 个关键帧"
+        )
         return successful_count
-        
+
     except Exception as e:
         print(f"[抽帧-心跳-批量] ❌ 批量提取关键帧时出错: {str(e)}")
         import traceback
+
         print(f"[抽帧-心跳-批量] 详细错误: {traceback.format_exc()}")
-        
+
         return 0
 
 
-def extract_keyframes_parallel_with_heartbeat(video_path, scene_info_list, heartbeat_result):
+def extract_keyframes_parallel_with_heartbeat(
+    video_path, scene_info_list, heartbeat_result
+):
     """带心跳监控的并行关键帧提取函数（备用方案）
-    
+
     参数:
         video_path (str): 视频文件路径
         scene_info_list (list): 场景信息列表
         heartbeat_result: 心跳监控结果字典
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
     import concurrent.futures
     import threading
-    
+
     # 线程安全的计数器，用于进度更新
     completed_count = 0
     lock = threading.Lock()
-    
+
     def update_progress():
         """线程安全的进度更新函数"""
         nonlocal completed_count
@@ -1171,14 +1339,16 @@ def extract_keyframes_parallel_with_heartbeat(video_path, scene_info_list, heart
             if completed_count % 5 == 0:
                 heartbeat_result["last_heartbeat"] = time.time()
                 heartbeat_result["heartbeat_count"] += 1
-                print(f"[抽帧-心跳-并行] ⏳ 已完成: {completed_count}/{len(scene_info_list)}，心跳计数: {heartbeat_result['heartbeat_count']}")
-    
+                print(
+                    f"[抽帧-心跳-并行] ⏳ 已完成: {completed_count}/{len(scene_info_list)}，心跳计数: {heartbeat_result['heartbeat_count']}"
+                )
+
     def extract_single_frame(scene_info):
         """提取单个场景的关键帧（使用OpenCV）"""
-        scene_index = scene_info['scene_index']
-        middle_frame = scene_info['middle_frame']
-        output_file = scene_info['output_file']
-        
+        scene_index = scene_info["scene_index"]
+        middle_frame = scene_info["middle_frame"]
+        output_file = scene_info["output_file"]
+
         # 使用OpenCV提取关键帧
         try:
             # 打开视频
@@ -1186,31 +1356,31 @@ def extract_keyframes_parallel_with_heartbeat(video_path, scene_info_list, heart
             if not cap.isOpened():
                 update_progress()
                 return False
-            
+
             # 跳转到目标帧
             cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-            
+
             # 读取帧
             ret, frame = cap.read()
-            
+
             if ret and frame is not None:
                 # 确保输出目录存在
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                
+
                 # 使用 cv2.imencode + 手动写入来支持中文路径
                 try:
-                    success, encoded_img = cv2.imencode('.png', frame)
+                    success, encoded_img = cv2.imencode(".png", frame)
                     if success:
-                        with open(output_file, 'wb') as f:
+                        with open(output_file, "wb") as f:
                             f.write(encoded_img.tobytes())
                         success = True
                     else:
                         success = False
                 except:
                     success = False
-                
+
                 cap.release()
-                
+
                 if success:
                     update_progress()
                     return True
@@ -1221,29 +1391,31 @@ def extract_keyframes_parallel_with_heartbeat(video_path, scene_info_list, heart
                 cap.release()
                 update_progress()
                 return False
-                
+
         except Exception as e:
-            print(f"[抽帧-心跳-并行] ⚠️ 提取场景 {scene_index+1} 关键帧失败: {str(e)}")
+            print(f"[抽帧-心跳-并行] ⚠️ 提取场景 {scene_index + 1} 关键帧失败: {str(e)}")
             update_progress()
             return False
-    
+
     # 使用线程池并行处理
     max_workers = min(4, len(scene_info_list))
     successful_count = 0
-    
+
     # 显示初始状态
     print(f"[抽帧-心跳-并行] 准备并行提取 {len(scene_info_list)} 个场景的关键帧...")
-    
+
     # 发送开始心跳
     heartbeat_result["last_heartbeat"] = time.time()
     heartbeat_result["heartbeat_count"] += 1
-    
+
     # 使用线程池执行器进行并行处理
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有提取任务到线程池
-        future_to_scene = {executor.submit(extract_single_frame, scene_info): scene_info 
-                          for scene_info in scene_info_list}
-        
+        future_to_scene = {
+            executor.submit(extract_single_frame, scene_info): scene_info
+            for scene_info in scene_info_list
+        }
+
         # 收集处理结果，确保所有任务完成
         for future in concurrent.futures.as_completed(future_to_scene):
             scene_info = future_to_scene[future]
@@ -1253,24 +1425,30 @@ def extract_keyframes_parallel_with_heartbeat(video_path, scene_info_list, heart
                     successful_count += 1
             except Exception as e:
                 # 记录失败信息
-                print(f"[抽帧-心跳-并行] ⚠️ 提取场景 {scene_info['scene_index']+1} 关键帧失败: {str(e)}")
-    
+                print(
+                    f"[抽帧-心跳-并行] ⚠️ 提取场景 {scene_info['scene_index'] + 1} 关键帧失败: {str(e)}"
+                )
+
     # 发送完成心跳
     heartbeat_result["last_heartbeat"] = time.time()
     heartbeat_result["heartbeat_count"] += 1
-    
-    print(f"[抽帧-心跳-并行] ✅ 并行提取完成！成功提取 {successful_count}/{len(scene_info_list)} 个关键帧")
+
+    print(
+        f"[抽帧-心跳-并行] ✅ 并行提取完成！成功提取 {successful_count}/{len(scene_info_list)} 个关键帧"
+    )
     return successful_count
 
 
-def extract_keyframes_traditional_with_heartbeat(video_path, output_dir, heartbeat_result):
+def extract_keyframes_traditional_with_heartbeat(
+    video_path, output_dir, heartbeat_result
+):
     """带心跳监控的传统关键帧提取方法（备用方案）
-    
+
     参数:
         video_path (str): 视频文件路径
         output_dir (str): 关键帧输出目录
         heartbeat_result: 心跳监控结果字典
-        
+
     返回:
         int: 成功提取的关键帧数量
     """
@@ -1288,7 +1466,9 @@ def extract_keyframes_traditional_with_heartbeat(video_path, output_dir, heartbe
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps
 
-    print(f"[抽帧-心跳-传统] 视频信息: {duration:.1f}秒, {total_frames}帧, {fps:.2f}FPS")
+    print(
+        f"[抽帧-心跳-传统] 视频信息: {duration:.1f}秒, {total_frames}帧, {fps:.2f}FPS"
+    )
 
     # 设置关键帧间隔（每5秒提取一帧）
     frame_interval = int(fps * 5)
@@ -1303,8 +1483,10 @@ def extract_keyframes_traditional_with_heartbeat(video_path, output_dir, heartbe
         if frame_index % (frame_interval * 10) == 0:
             heartbeat_result["last_heartbeat"] = time.time()
             heartbeat_result["heartbeat_count"] += 1
-            print(f"[抽帧-心跳-传统] 处理进度: {frame_index}/{total_frames}，心跳计数: {heartbeat_result['heartbeat_count']}")
-        
+            print(
+                f"[抽帧-心跳-传统] 处理进度: {frame_index}/{total_frames}，心跳计数: {heartbeat_result['heartbeat_count']}"
+            )
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ret, frame = cap.read()
 
@@ -1312,14 +1494,14 @@ def extract_keyframes_traditional_with_heartbeat(video_path, output_dir, heartbe
             output_file = os.path.join(output_dir, f"{keyframe_count:04d}.png")
             # 使用 cv2.imencode + 手动写入来支持中文路径
             try:
-                success, encoded_img = cv2.imencode('.png', frame)
+                success, encoded_img = cv2.imencode(".png", frame)
                 if success:
-                    with open(output_file, 'wb') as f:
+                    with open(output_file, "wb") as f:
                         f.write(encoded_img.tobytes())
                     keyframe_count += 1
             except Exception as e:
                 print(f"[抽帧-心跳-传统] 保存失败: {str(e)}")
-            
+
             if keyframe_count % 10 == 0:
                 print(f"[抽帧-心跳-传统] ⏳ 已提取: {keyframe_count}")
 
@@ -1332,6 +1514,7 @@ def extract_keyframes_traditional_with_heartbeat(video_path, output_dir, heartbe
     print(f"[抽帧-心跳-传统] ✅ 传统方法提取完成! 共提取 {keyframe_count} 个关键帧")
     return keyframe_count
 
+
 # --- FunASR自动语音识别模块 ---
 def setup_funasr_model():
     """初始化FunASR模型（模型应该已经由run.py下载）"""
@@ -1339,9 +1522,9 @@ def setup_funasr_model():
         # 如果模型已经初始化，直接返回
         if st.session_state.funasr_model is not None:
             return True
-        
+
         # 使用环境变量中的缓存目录（由run.py设置）
-        if 'MODELSCOPE_CACHE_DIR' not in os.environ:
+        if "MODELSCOPE_CACHE_DIR" not in os.environ:
             st.error("缓存目录环境变量未设置，请通过 run.py 启动程序")
             return False
 
@@ -1353,7 +1536,7 @@ def setup_funasr_model():
                 vad_model="damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
                 punc_model="damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
                 disable_update=True,  # 禁止更新
-                disable_log=False
+                disable_log=False,
             )
 
         st.session_state.funasr_model = model
@@ -1363,8 +1546,10 @@ def setup_funasr_model():
     except Exception as e:
         st.error(f"❌ FunASR模型初始化失败: {e}")
         import traceback
+
         st.error(f"详细错误: {traceback.format_exc()}")
         return False
+
 
 def extract_audio_from_video(video_path):
     """从视频中提取音频"""
@@ -1372,24 +1557,31 @@ def extract_audio_from_video(video_path):
 
     try:
         # 使用session_state中保存的FFmpeg路径，优先使用项目内置的FFmpeg
-        ffmpeg_cmd = st.session_state.get('ffmpeg_path', 'ffmpeg')
+        ffmpeg_cmd = st.session_state.get("ffmpeg_path", "ffmpeg")
         command = [
             ffmpeg_cmd,
-            '-i', video_path,
-            '-vn',
-            '-acodec', 'pcm_s16le',
-            '-ar', '16000',
-            '-ac', '1',
+            "-i",
+            video_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
             audio_path,
-            '-y'  # 覆盖已存在的文件
+            "-y",  # 覆盖已存在的文件
         ]
 
-        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
         return audio_path
 
     except Exception as e:
         st.error(f"音频提取失败: {e}")
         return None
+
 
 def transcribe_audio(audio_path):
     """使用FunASR进行语音转录"""
@@ -1402,10 +1594,7 @@ def transcribe_audio(audio_path):
         with st.spinner("语音转录中..."):
             # 使用FunASR进行语音识别
             result = st.session_state.funasr_model.generate(
-                input=audio_path,
-                cache={},
-                language="auto",
-                use_itn=True
+                input=audio_path, cache={}, language="auto", use_itn=True
             )
 
         # 提取转录文本
@@ -1420,6 +1609,7 @@ def transcribe_audio(audio_path):
     except Exception as e:
         st.error(f"语音转录失败: {e}")
         return None
+
 
 def run_asr_analysis(video_path):
     """运行完整的ASR分析流程"""
@@ -1446,12 +1636,14 @@ def run_asr_analysis(video_path):
             print(f"清理音频文件失败: {cleanup_error}")
 
         return transcription
-    
+
     except Exception as e:
         print(f"ASR分析失败: {e}")
         import traceback
+
         traceback.print_exc()
         return None
+
 
 # --- 图片处理模块 ---
 def read_image_as_base64(image_path):
@@ -1465,12 +1657,11 @@ def read_image_as_base64(image_path):
         st.error(f"读取或编码图片 {image_path} 时出错: {e}")
         return None
 
-def get_sorted_image_files(directory="keyframes"):
+
+def get_sorted_image_files(directory=DEFAULT_KEYFRAME_DIR):
     """获取目录中按数字序号排序的图片文件列表"""
-    image_files = []
-    for ext in ('.jpg', '.jpeg', '.png'):
-        image_files.extend(glob.glob(os.path.join(directory, f"*{ext}")))
-    
+    image_files = list_image_files(directory)
+
     filtered_files = []
     for file in image_files:
         try:
@@ -1479,23 +1670,26 @@ def get_sorted_image_files(directory="keyframes"):
             filtered_files.append((num, file))
         except ValueError:
             continue
-    
+
     sorted_files = sorted(filtered_files, key=lambda x: x[0])
     return [file for _, file in sorted_files]
+
 
 def get_mime_type(filename):
     """根据文件扩展名返回对应的MIME类型"""
     ext = os.path.splitext(filename)[1].lower()
-    if ext in ('.jpg', '.jpeg'):
-        return 'image/jpeg'
-    elif ext == '.png':
-        return 'image/png'
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    elif ext == ".png":
+        return "image/png"
     else:
-        return 'application/octet-stream'
+        return "application/octet-stream"
+
 
 # --- 多模态分析与并发控制模块 ---
 class RateLimiter:
     """速率限制器，确保不超过60 QPM"""
+
     def __init__(self, max_requests_per_minute=60):
         self.max_requests = max_requests_per_minute
         self.requests = []
@@ -1514,16 +1708,31 @@ class RateLimiter:
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
                 # 重新清理并检查
-                self.requests = [req_time for req_time in self.requests if now + wait_time - req_time < 60]
+                self.requests = [
+                    req_time
+                    for req_time in self.requests
+                    if now + wait_time - req_time < 60
+                ]
 
         # 记录当前请求
         self.requests.append(time.time())
 
-async def process_single_image(image_file, output_file, cache_dir, max_retries=3, 
-                               user_custom_prompt="", use_ollama=False, selected_model="", 
-                               client=None, vlm_model="", rate_limiter=None, skip_cache=False):
+
+async def process_single_image(
+    image_file,
+    output_file,
+    cache_dir,
+    max_retries=3,
+    user_custom_prompt="",
+    use_ollama=False,
+    selected_model="",
+    client=None,
+    vlm_model="",
+    rate_limiter=None,
+    skip_cache=False,
+):
     """异步处理单张图片
-    
+
     Args:
         image_file: 图片文件路径
         output_file: 输出文件路径
@@ -1545,8 +1754,18 @@ async def process_single_image(image_file, output_file, cache_dir, max_retries=3
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cached_result = f.read()
-            if cached_result and cached_result.strip() and not cached_result.startswith("处理失败"):
-                return {"filename": filename, "result": cached_result, "cached": True, "success": True, "processing_time": 0}
+            if (
+                cached_result
+                and cached_result.strip()
+                and not cached_result.startswith("处理失败")
+            ):
+                return {
+                    "filename": filename,
+                    "result": cached_result,
+                    "cached": True,
+                    "success": True,
+                    "processing_time": 0,
+                }
         except:
             pass
 
@@ -1576,17 +1795,17 @@ async def process_single_image(image_file, output_file, cache_dir, max_retries=3
                         model=selected_model,
                         messages=[
                             {
-                                'role': 'user',
-                                'content': full_prompt,
-                                'images': [image_file]
+                                "role": "user",
+                                "content": full_prompt,
+                                "images": [image_file],
                             }
                         ],
                         options={
-                            'num_ctx': 4096,  # 明确设置上下文窗口大小
-                        }
-                    )
+                            "num_ctx": 4096,  # 明确设置上下文窗口大小
+                        },
+                    ),
                 )
-                result = response['message']['content']
+                result = response["message"]["content"]
             else:
                 # 使用阿里云 DashScope 处理
                 mime_type = get_mime_type(image_file)
@@ -1600,23 +1819,21 @@ async def process_single_image(image_file, output_file, cache_dir, max_retries=3
                         "role": "user",
                         "content": [
                             {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": full_prompt}
-                        ]
+                            {"type": "text", "text": full_prompt},
+                        ],
                     }
                 ]
-                
+
                 # 使用 aiohttp 进行异步HTTP请求（如果可能），否则用executor
                 loop = asyncio.get_event_loop()
                 completion = await loop.run_in_executor(
                     None,
                     lambda: client.chat.completions.create(
-                        model=vlm_model,
-                        messages=messages,
-                        stream=False
-                    )
+                        model=vlm_model, messages=messages, stream=False
+                    ),
                 )
                 result = completion.choices[0].message.content
-                
+
                 # 注意：不在此处更新Token统计，因为异步线程无法访问 st.session_state
                 # Token用量仅使用公式预估，不实时修改
 
@@ -1626,7 +1843,7 @@ async def process_single_image(image_file, output_file, cache_dir, max_retries=3
 
         except Exception as e:
             if attempt < max_retries - 1:
-                await asyncio.sleep(min(2 ** attempt, 30))
+                await asyncio.sleep(min(2**attempt, 30))
             else:
                 result = f"处理失败: {str(e)}"
                 processing_time = time.time() - start_time
@@ -1650,7 +1867,14 @@ async def process_single_image(image_file, output_file, cache_dir, max_retries=3
             f.write(f"❌ 图片 {filename} 处理失败 (使用模型: {model_name})\n")
         f.write("-" * 80 + "\n")
 
-    return {"filename": filename, "result": result, "cached": False, "success": success, "processing_time": processing_time}
+    return {
+        "filename": filename,
+        "result": result,
+        "cached": False,
+        "success": success,
+        "processing_time": processing_time,
+    }
+
 
 async def process_images_concurrently(image_files, output_file, cache_dir):
     """并发处理多张图片"""
@@ -1662,7 +1886,10 @@ async def process_images_concurrently(image_files, output_file, cache_dir):
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
 
-async def process_single_image_with_display(image_file, output_file, cache_dir, container):
+
+async def process_single_image_with_display(
+    image_file, output_file, cache_dir, container
+):
     """处理单张图片并在指定容器中实时展示结果"""
     result = await process_single_image(image_file, output_file, cache_dir)
 
@@ -1671,13 +1898,17 @@ async def process_single_image_with_display(image_file, output_file, cache_dir, 
         # 显示图片
         try:
             img = Image.open(image_file)
-            st.image(img, caption=f"关键帧: {result['filename']}", use_container_width=True)
+            st.image(
+                img, caption=f"关键帧: {result['filename']}", use_container_width=True
+            )
         except:
             st.warning(f"无法显示图片: {result['filename']}")
 
         # 显示分析结果
-        if result['success']:
-            st.success(f"✅ {result['filename']} 分析完成 ({result['processing_time']:.1f}秒)")
+        if result["success"]:
+            st.success(
+                f"✅ {result['filename']} 分析完成 ({result['processing_time']:.1f}秒)"
+            )
             st.markdown(f"**分析结果:**\n{result['result']}")
         else:
             st.error(f"❌ {result['filename']} 分析失败")
@@ -1685,6 +1916,7 @@ async def process_single_image_with_display(image_file, output_file, cache_dir, 
         st.divider()
 
     return result
+
 
 def process_image_group(group, output_file, max_retries=3):
     """处理单张/多张图片并保存分析结果"""
@@ -1720,17 +1952,13 @@ def process_image_group(group, output_file, max_retries=3):
                 response = client.chat(
                     model=st.session_state.selected_model,
                     messages=[
-                        {
-                            'role': 'user',
-                            'content': full_prompt,
-                            'images': [image_file]
-                        }
+                        {"role": "user", "content": full_prompt, "images": [image_file]}
                     ],
                     options={
-                        'num_ctx': 4096,  # 明确设置上下文窗口大小，每次独立
-                    }
+                        "num_ctx": 4096,  # 明确设置上下文窗口大小，每次独立
+                    },
                 )
-                result = response['message']['content']
+                result = response["message"]["content"]
             else:
                 # 使用阿里云 DashScope 处理
                 mime_type = get_mime_type(image_file)
@@ -1744,17 +1972,17 @@ def process_image_group(group, output_file, max_retries=3):
                         "role": "user",
                         "content": [
                             {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": full_prompt}
-                        ]
+                            {"type": "text", "text": full_prompt},
+                        ],
                     }
                 ]
                 completion = st.session_state.client.chat.completions.create(
                     model=st.session_state.vlm_model,  # 使用视觉模型
                     messages=messages,
-                    stream=False
+                    stream=False,
                 )
                 result = completion.choices[0].message.content
-                
+
                 # Token用量仅使用公式预估，不实时修改
 
             processing_time = time.time() - start_time
@@ -1764,20 +1992,22 @@ def process_image_group(group, output_file, max_retries=3):
         except Exception as e:
             status.warning(f"处理错误 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
             if attempt < max_retries - 1:
-                sleep_time = min(2 ** attempt, 30)
+                sleep_time = min(2**attempt, 30)
                 time.sleep(sleep_time)
             else:
                 status.error(f"处理失败，已达到最大重试次数 ({max_retries})")
 
     # 保存到缓存目录（确保目录存在）
     os.makedirs(st.session_state.cache_dir, exist_ok=True)
-    cache_file = os.path.join(st.session_state.cache_dir, f"{os.path.splitext(filename)[0]}.txt")
+    cache_file = os.path.join(
+        st.session_state.cache_dir, f"{os.path.splitext(filename)[0]}.txt"
+    )
     with open(cache_file, "w", encoding="utf-8") as f:
         if success:
             f.write(result.strip())
         else:
             f.write("处理失败")
-    
+
     # 保存结果到文件
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(f"图片: {filename}\n")
@@ -1787,7 +2017,9 @@ def process_image_group(group, output_file, max_retries=3):
             f.write("解析结果:\n")
             f.write(result.strip() + "\n")
         else:
-            f.write(f"❌ 图片 {filename} 处理失败 (使用模型: {st.session_state.selected_model})\n")
+            f.write(
+                f"❌ 图片 {filename} 处理失败 (使用模型: {st.session_state.selected_model})\n"
+            )
         f.write("-" * 80 + "\n")
 
     if success:
@@ -1798,29 +2030,30 @@ def process_image_group(group, output_file, max_retries=3):
         status.error(f"最终处理失败: {filename}")
         return False
 
+
 # --- Embedding模型管理模块 ---
 def find_embedding_model():
     """查找已下载的Qwen3 Embedding模型"""
     cache_dir = get_program_cache_dir()
-    modelscope_cache = os.path.join(cache_dir, 'modelscope', 'hub')
-    
+    modelscope_cache = os.path.join(cache_dir, "modelscope", "hub")
+
     # 检查Qwen3-Embedding-0.6B模型
     # Windows系统会将点号替换为下划线，需要兼容两种命名方式
-    model_name_original = 'Qwen/Qwen3-Embedding-0.6B'
-    model_name_windows = 'Qwen/Qwen3-Embedding-0___6B'  # Windows兼容版本
-    
+    model_name_original = "Qwen/Qwen3-Embedding-0.6B"
+    model_name_windows = "Qwen/Qwen3-Embedding-0___6B"  # Windows兼容版本
+
     # 优先检查Windows兼容版本
     model_path = os.path.join(modelscope_cache, model_name_windows)
     if os.path.exists(model_path):
         st.info(f"✅ 找到Qwen3 Embedding模型: {model_path}")
         return model_path
-    
+
     # 回退检查原始版本
     model_path = os.path.join(modelscope_cache, model_name_original)
     if os.path.exists(model_path):
         st.info(f"✅ 找到Qwen3 Embedding模型: {model_path}")
         return model_path
-    
+
     st.warning("⚠️ 未找到Qwen3 Embedding模型")
     st.info("将使用备用的英文模型（效果可能略差）")
     return None
@@ -1831,14 +2064,14 @@ def load_embedding_model():
     try:
         # 查找已下载的中文模型
         model_path = find_embedding_model()
-        
+
         if model_path:
             # 使用ModelScope下载的中文模型
             st.info("正在加载中文Embedding模型...")
             with st.spinner("加载中..."):
                 embeddings = HuggingFaceEmbeddings(
                     model_name=model_path,
-                    model_kwargs={'device': 'cpu'}  # 使用CPU，避免GPU冲突
+                    model_kwargs={"device": "cpu"},  # 使用CPU，避免GPU冲突
                 )
             st.success("✅ 中文Embedding模型加载成功！")
             return embeddings
@@ -1848,16 +2081,17 @@ def load_embedding_model():
             with st.spinner("加载备用模型..."):
                 embeddings = HuggingFaceEmbeddings(
                     model_name="sentence-transformers/all-MiniLM-L6-v2",
-                    model_kwargs={'device': 'cpu'}
+                    model_kwargs={"device": "cpu"},
                 )
             st.info("✅ 备用Embedding模型加载成功")
             return embeddings
-        
+
     except Exception as e:
         st.error(f"❌ Embedding模型加载失败: {e}")
         import traceback
+
         st.error(f"详细错误: {traceback.format_exc()}")
-        
+
         # 最后的回退方案
         try:
             st.warning("尝试使用最简单的备用模型...")
@@ -1874,61 +2108,62 @@ def load_embedding_model():
 # --- RAG检索增强生成模块 ---
 def force_close_chroma_db(vector_store):
     """强制关闭ChromaDB连接并释放文件句柄
-    
+
     Args:
         vector_store: ChromaDB向量存储对象
     """
     if not vector_store:
         return
-    
+
     try:
         # 1. 尝试关闭集合连接
-        if hasattr(vector_store, '_collection'):
+        if hasattr(vector_store, "_collection"):
             try:
                 # ChromaDB的collection可能有close方法
-                if hasattr(vector_store._collection, 'close'):
+                if hasattr(vector_store._collection, "close"):
                     vector_store._collection.close()
             except:
                 pass
-        
+
         # 2. 尝试关闭客户端连接
-        if hasattr(vector_store, '_client'):
+        if hasattr(vector_store, "_client"):
             try:
                 # ChromaDB的client可能有close或reset方法
-                if hasattr(vector_store._client, 'close'):
+                if hasattr(vector_store._client, "close"):
                     vector_store._client.close()
-                elif hasattr(vector_store._client, 'reset'):
+                elif hasattr(vector_store._client, "reset"):
                     vector_store._client.reset()
             except:
                 pass
-        
+
         # 3. 尝试删除持久化客户端的引用
-        if hasattr(vector_store, '_persist_directory'):
+        if hasattr(vector_store, "_persist_directory"):
             try:
-                delattr(vector_store, '_persist_directory')
+                delattr(vector_store, "_persist_directory")
             except:
                 pass
     except Exception as e:
         print(f"关闭ChromaDB时出错: {e}")
 
+
 def safe_remove_chroma_db(chroma_db_path, max_retries=5):
     """安全删除ChromaDB文件夹
-    
+
     Args:
         chroma_db_path: ChromaDB路径
         max_retries: 最大重试次数
-        
+
     Returns:
         bool: 是否成功删除
     """
     import gc
     import time
-    
+
     if not os.path.exists(chroma_db_path):
         return True
-    
+
     st.info(f"正在清理旧的向量数据库: {chroma_db_path}")
-    
+
     # 先尝试关闭当前的vector_store
     if st.session_state.vector_store:
         try:
@@ -1936,17 +2171,17 @@ def safe_remove_chroma_db(chroma_db_path, max_retries=5):
             st.session_state.vector_store = None
         except Exception as e:
             print(f"关闭vector_store时出错: {e}")
-    
+
     # 强制垃圾回收多次
     for _ in range(3):
         gc.collect()
         time.sleep(0.3)
-    
+
     # 尝试删除
     for attempt in range(max_retries):
         try:
             # Windows特定：尝试重命名文件夹（有时比直接删除更可靠）
-            if sys.platform == 'win32' and attempt > 0:
+            if sys.platform == "win32" and attempt > 0:
                 try:
                     temp_path = chroma_db_path + f"_deleting_{int(time.time())}"
                     os.rename(chroma_db_path, temp_path)
@@ -1954,18 +2189,20 @@ def safe_remove_chroma_db(chroma_db_path, max_retries=5):
                     st.info(f"已重命名数据库文件夹（尝试 {attempt + 1}/{max_retries}）")
                 except:
                     pass
-            
+
             # 尝试删除
             shutil.rmtree(chroma_db_path, ignore_errors=False)
             st.success("✅ 已清除旧的向量数据库")
             return True
-            
+
         except PermissionError as e:
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2  # 递增等待时间：2秒, 4秒, 6秒...
-                st.warning(f"⚠️ 数据库文件被占用，等待{wait_time}秒后重试... ({attempt + 1}/{max_retries})")
+                st.warning(
+                    f"⚠️ 数据库文件被占用，等待{wait_time}秒后重试... ({attempt + 1}/{max_retries})"
+                )
                 time.sleep(wait_time)
-                
+
                 # 每次重试前再次强制垃圾回收
                 for _ in range(3):
                     gc.collect()
@@ -1982,7 +2219,7 @@ def safe_remove_chroma_db(chroma_db_path, max_retries=5):
                 5. 使用任务管理器结束相关Python进程
                 """)
                 return False
-                
+
         except Exception as e:
             st.error(f"❌ 删除数据库时出错: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
@@ -1990,42 +2227,44 @@ def safe_remove_chroma_db(chroma_db_path, max_retries=5):
                 time.sleep(2)
             else:
                 return False
-    
+
     return False
+
 
 def build_vector_store(cache_dir, force_rebuild=False):
     """构建向量数据库（支持持久化和增量更新）"""
     try:
         # 确保缓存目录存在
         os.makedirs(cache_dir, exist_ok=True)
-        
+
         # 向量数据库路径
         chroma_db_path = st.session_state.vector_store_path
-        
+
         # 加载或创建嵌入模型
         if st.session_state.embedding_model is None:
             st.info("首次使用，正在初始化Embedding模型...")
             st.session_state.embedding_model = load_embedding_model()
-            
+
             if st.session_state.embedding_model is None:
                 st.error("Embedding模型加载失败，无法构建向量数据库")
                 return None
-        
+
         embeddings = st.session_state.embedding_model
-        
+
         # 检查是否已存在向量数据库且不强制重建
         if os.path.exists(chroma_db_path) and not force_rebuild:
             try:
                 st.info("加载已存在的向量数据库...")
                 vector_store = Chroma(
-                    persist_directory=chroma_db_path,
-                    embedding_function=embeddings
+                    persist_directory=chroma_db_path, embedding_function=embeddings
                 )
-                
+
                 # 验证数据库是否有效
                 collection = vector_store._collection
                 if collection.count() > 0:
-                    st.success(f"成功加载向量数据库，包含 {collection.count()} 个文档片段")
+                    st.success(
+                        f"成功加载向量数据库，包含 {collection.count()} 个文档片段"
+                    )
                     return vector_store
                 else:
                     st.warning("向量数据库为空，将重新构建")
@@ -2043,11 +2282,15 @@ def build_vector_store(cache_dir, force_rebuild=False):
         for cache_file in sorted(cache_files):
             with open(cache_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-                if content and content != "处理失败" and not content.startswith("处理失败:"):
+                if (
+                    content
+                    and content != "处理失败"
+                    and not content.startswith("处理失败:")
+                ):
                     # 从文件名提取信息
                     filename = os.path.basename(cache_file)
                     frame_num = os.path.splitext(filename)[0]
-                    
+
                     # 判断是ASR内容还是关键帧内容
                     if filename == "asr_transcription.txt":
                         # ASR语音转录内容
@@ -2057,7 +2300,7 @@ def build_vector_store(cache_dir, force_rebuild=False):
                             "source": cache_file,
                             "content_type": "audio",  # 音频内容
                             "char_count": len(content),
-                            "timestamp": os.path.getmtime(cache_file)
+                            "timestamp": os.path.getmtime(cache_file),
                         }
                     else:
                         # 关键帧视觉内容
@@ -2067,13 +2310,10 @@ def build_vector_store(cache_dir, force_rebuild=False):
                             "source": cache_file,
                             "content_type": "visual",  # 视觉内容
                             "char_count": len(content),
-                            "timestamp": os.path.getmtime(cache_file)
+                            "timestamp": os.path.getmtime(cache_file),
                         }
-                    
-                    documents.append(Document(
-                        page_content=content,
-                        metadata=metadata
-                    ))
+
+                    documents.append(Document(page_content=content, metadata=metadata))
 
         if not documents:
             st.warning("没有有效的文档内容")
@@ -2086,7 +2326,7 @@ def build_vector_store(cache_dir, force_rebuild=False):
             chunk_size=800,  # 增加块大小以保留更多上下文
             chunk_overlap=100,  # 增加重叠以保持连贯性
             length_function=len,
-            separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
+            separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""],
         )
         split_documents = text_splitter.split_documents(documents)
 
@@ -2099,34 +2339,38 @@ def build_vector_store(cache_dir, force_rebuild=False):
                 st.error("⚠️ 无法删除旧数据库，将尝试继续...")
                 st.warning("如果后续构建失败，请手动删除数据库文件夹或重启程序")
                 # 不直接返回None，尝试继续（可能会失败，但给用户一个机会）
-        
+
         # 确保向量数据库目录的父目录存在
         parent_dir = os.path.dirname(chroma_db_path)
         if parent_dir:  # 如果有父目录
             os.makedirs(parent_dir, exist_ok=True)
-        
+
         # 创建向量数据库（持久化）
         with st.spinner("正在构建向量索引..."):
             vector_store = Chroma.from_documents(
                 documents=split_documents,
                 embedding=embeddings,
-                persist_directory=chroma_db_path
+                persist_directory=chroma_db_path,
             )
 
         st.success(f"✅ 向量数据库构建完成，包含 {len(split_documents)} 个文档片段")
         st.info(f"📁 数据库已保存至: {chroma_db_path}")
-        
+
         return vector_store
 
     except Exception as e:
         st.error(f"构建向量数据库失败: {e}")
         import traceback
+
         st.error(f"详细错误信息: {traceback.format_exc()}")
         return None
 
-def search_vector_store(query, vector_store, k=5, search_type="similarity", score_threshold=0.5, fetch_k=20):
+
+def search_vector_store(
+    query, vector_store, k=5, search_type="similarity", score_threshold=0.5, fetch_k=20
+):
     """在向量数据库中搜索相关内容（支持多种检索策略）
-    
+
     参数:
         query: 查询字符串
         vector_store: 向量数据库
@@ -2143,33 +2387,35 @@ def search_vector_store(query, vector_store, k=5, search_type="similarity", scor
         if search_type == "mmr":
             # 最大边际相关性搜索（减少冗余）
             results = vector_store.max_marginal_relevance_search(
-                query, 
-                k=k, 
-                fetch_k=fetch_k
+                query, k=k, fetch_k=fetch_k
             )
         elif search_type == "similarity_score":
             # 带相似度分数的搜索
             results_with_scores = vector_store.similarity_search_with_score(query, k=k)
             # 过滤低于阈值的结果
-            results = [doc for doc, score in results_with_scores if score <= score_threshold]
+            results = [
+                doc for doc, score in results_with_scores if score <= score_threshold
+            ]
             if not results:
                 st.warning(f"未找到相似度高于阈值 {score_threshold} 的结果")
         else:
             # 默认相似度搜索
             results = vector_store.similarity_search(query, k=k)
-        
+
         # 按帧号排序结果（如果有frame_number元数据）
         try:
-            results = sorted(results, key=lambda x: x.metadata.get('frame_number', 0))
+            results = sorted(results, key=lambda x: x.metadata.get("frame_number", 0))
         except:
             pass
-            
+
         return results
     except Exception as e:
         st.error(f"搜索失败: {e}")
         import traceback
+
         st.error(f"详细错误: {traceback.format_exc()}")
         return []
+
 
 def generate_rag_response(query, search_results, include_citations=True):
     """基于检索结果生成回答（使用多方式分析页面的独立模型配置）"""
@@ -2179,12 +2425,12 @@ def generate_rag_response(query, search_results, include_citations=True):
     # 构建带编号的上下文（用于引用）
     context_parts = []
     frame_references = []
-    
+
     for i, doc in enumerate(search_results, 1):
-        frame_num = doc.metadata.get('frame', '未知')
+        frame_num = doc.metadata.get("frame", "未知")
         frame_references.append(frame_num)
         context_parts.append(f"[片段{i}] (关键帧 {frame_num}):\n{doc.page_content}")
-    
+
     context = "\n\n".join(context_parts)
 
     # 优化的提示词
@@ -2207,28 +2453,23 @@ def generate_rag_response(query, search_results, include_citations=True):
 
     try:
         response_text = ""
-        
+
         # 使用多方式分析页面的独立配置
         if st.session_state.llm_use_ollama:
             # 使用Ollama
             if not st.session_state.llm_ollama_model:
                 return "错误：未选择Ollama模型", []
-            
+
             # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
             client = Client(host="http://localhost:11434")
             response = client.chat(
                 model=st.session_state.llm_ollama_model,
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': prompt
-                    }
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 options={
-                    'num_ctx': 4096,  # 明确设置上下文窗口，每次独立
-                }
+                    "num_ctx": 4096,  # 明确设置上下文窗口，每次独立
+                },
             )
-            response_text = response['message']['content']
+            response_text = response["message"]["content"]
         else:
             # 使用阿里云DashScope的LLM模型
             if not st.session_state.client:
@@ -2241,37 +2482,34 @@ def generate_rag_response(query, search_results, include_citations=True):
                     )
                 else:
                     return "错误：阿里云客户端未初始化，请检查API密钥", []
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+
+            messages = [{"role": "user", "content": prompt}]
             completion = st.session_state.client.chat.completions.create(
                 model=st.session_state.llm_model,  # 使用LLM模型
                 messages=messages,
-                stream=False
+                stream=False,
             )
             response_text = completion.choices[0].message.content
-            
+
             # Token用量仅使用公式预估，不实时修改
-        
+
         # 添加引用信息
         if include_citations:
             citations = "\n\n---\n**引用的关键帧:**\n"
             for i, frame_num in enumerate(frame_references, 1):
                 citations += f"- [片段{i}] 关键帧 {frame_num}\n"
             response_text += citations
-        
+
         return response_text, frame_references
-        
+
     except Exception as e:
         error_msg = f"生成回答失败: {str(e)}"
         import traceback
+
         error_detail = traceback.format_exc()
         st.error(f"详细错误: {error_detail}")
         return f"{error_msg}\n\n详细错误:\n{error_detail}", []
+
 
 # --- 成文与速读功能模块 ---
 def generate_comprehensive_report(cache_dir):
@@ -2285,13 +2523,17 @@ def generate_comprehensive_report(cache_dir):
         # 分别读取视觉内容和语音内容
         visual_texts = []
         audio_text = None
-        
+
         for cache_file in sorted(cache_files):
             with open(cache_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-                if content and content != "处理失败" and not content.startswith("处理失败:"):
+                if (
+                    content
+                    and content != "处理失败"
+                    and not content.startswith("处理失败:")
+                ):
                     filename = os.path.basename(cache_file)
-                    
+
                     if filename == "asr_transcription.txt":
                         # 语音转录内容
                         audio_text = content
@@ -2305,14 +2547,14 @@ def generate_comprehensive_report(cache_dir):
 
         # 构建组合内容
         combined_parts = []
-        
+
         if visual_texts:
             combined_parts.append("【视觉内容分析】\n" + "\n\n".join(visual_texts))
-        
+
         if audio_text:
             combined_parts.append(f"【语音转录内容】\n{audio_text}")
-        
-        combined_text = "\n\n" + "="*50 + "\n\n".join(combined_parts)
+
+        combined_text = "\n\n" + "=" * 50 + "\n\n".join(combined_parts)
 
         # 构建成文提示词
         prompt = f"""你是一个专业的视频内容分析助手。请将以下关于一个视频的分析内容（包括关键帧视觉分析和语音转录）整合成一份连贯、详细、口语化的中文总结报告。
@@ -2332,22 +2574,17 @@ def generate_comprehensive_report(cache_dir):
             # 使用Ollama
             if not st.session_state.llm_ollama_model:
                 return "错误：未选择Ollama模型，请在左侧边栏配置"
-            
+
             # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
             client = Client(host="http://localhost:11434")
             response = client.chat(
                 model=st.session_state.llm_ollama_model,
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': prompt
-                    }
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 options={
-                    'num_ctx': 4096,  # 明确设置上下文窗口，每次独立
-                }
+                    "num_ctx": 4096,  # 明确设置上下文窗口，每次独立
+                },
             )
-            return response['message']['content']
+            return response["message"]["content"]
         else:
             # 使用阿里云DashScope的LLM模型
             if not st.session_state.client:
@@ -2360,27 +2597,24 @@ def generate_comprehensive_report(cache_dir):
                     )
                 else:
                     return "错误：阿里云客户端未初始化，请检查API密钥或在左侧边栏配置"
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+
+            messages = [{"role": "user", "content": prompt}]
             completion = st.session_state.client.chat.completions.create(
                 model=st.session_state.llm_model,  # 使用LLM模型
                 messages=messages,
-                stream=False
+                stream=False,
             )
-            
+
             # Token用量仅使用公式预估，不实时修改
-            
+
             return completion.choices[0].message.content
 
     except Exception as e:
         import traceback
+
         error_detail = traceback.format_exc()
         return f"生成报告失败: {str(e)}\n\n详细错误:\n{error_detail}"
+
 
 def generate_quick_summary(cache_dir):
     """生成快速摘要（使用多方式分析页面的独立模型配置）"""
@@ -2393,13 +2627,17 @@ def generate_quick_summary(cache_dir):
         # 分别读取视觉内容和语音内容
         visual_texts = []
         audio_text = None
-        
+
         for cache_file in sorted(cache_files):
             with open(cache_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-                if content and content != "处理失败" and not content.startswith("处理失败:"):
+                if (
+                    content
+                    and content != "处理失败"
+                    and not content.startswith("处理失败:")
+                ):
                     filename = os.path.basename(cache_file)
-                    
+
                     if filename == "asr_transcription.txt":
                         # 语音转录内容
                         audio_text = content
@@ -2412,13 +2650,13 @@ def generate_quick_summary(cache_dir):
 
         # 构建组合内容
         combined_parts = []
-        
+
         if visual_texts:
             combined_parts.append("视觉内容：" + "\n".join(visual_texts))
-        
+
         if audio_text:
             combined_parts.append(f"语音内容：{audio_text}")
-        
+
         combined_text = "\n\n".join(combined_parts)
 
         # 构建速读提示词
@@ -2435,22 +2673,17 @@ def generate_quick_summary(cache_dir):
             # 使用Ollama
             if not st.session_state.llm_ollama_model:
                 return "错误：未选择Ollama模型，请在左侧边栏配置"
-            
+
             # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
             client = Client(host="http://localhost:11434")
             response = client.chat(
                 model=st.session_state.llm_ollama_model,
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': prompt
-                    }
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 options={
-                    'num_ctx': 8192,  # 明确设置上下文窗口，每次独立
-                }
+                    "num_ctx": 8192,  # 明确设置上下文窗口，每次独立
+                },
             )
-            return response['message']['content']
+            return response["message"]["content"]
         else:
             # 使用阿里云DashScope的LLM模型
             if not st.session_state.client:
@@ -2463,27 +2696,24 @@ def generate_quick_summary(cache_dir):
                     )
                 else:
                     return "错误：阿里云客户端未初始化，请检查API密钥或在左侧边栏配置"
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+
+            messages = [{"role": "user", "content": prompt}]
             completion = st.session_state.client.chat.completions.create(
                 model=st.session_state.llm_model,  # 使用LLM模型
                 messages=messages,
-                stream=False
+                stream=False,
             )
-            
+
             # Token用量仅使用公式预估，不实时修改
-            
+
             return completion.choices[0].message.content
 
     except Exception as e:
         import traceback
+
         error_detail = traceback.format_exc()
         return f"生成摘要失败: {str(e)}\n\n详细错误:\n{error_detail}"
+
 
 # --- 停止Ollama模型函数 ---
 def stop_ollama_model():
@@ -2491,17 +2721,14 @@ def stop_ollama_model():
     if not st.session_state.selected_model:
         st.error("未选择任何Ollama模型")
         return False
-    
+
     try:
         # 构造停止命令
         command = ["ollama", "stop", st.session_state.selected_model]
-        
+
         # 执行命令
-        result = subprocess.run(command, 
-                              capture_output=True, 
-                              text=True, 
-                              check=True)
-        
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+
         # 检查执行结果
         if result.returncode == 0:
             st.success(f"已停止模型: {st.session_state.selected_model}")
@@ -2517,6 +2744,7 @@ def stop_ollama_model():
         st.error(f"发生未知错误: {str(e)}")
         return False
 
+
 # --- 主分析函数 ---
 def run_video_analysis():
     """视频分析主程序"""
@@ -2527,13 +2755,13 @@ def run_video_analysis():
         if not st.session_state.use_ollama:
             reset_token_usage()
             st.info("💰 用量统计已启用，将在分析过程中实时显示Token使用情况")
-        
+
         # 检查FFmpeg
         ffmpeg_available, ffmpeg_path = check_ffmpeg()
         if not ffmpeg_available:
             st.error("FFmpeg未安装或未找到，请确保FFmpeg已安装并添加到系统PATH")
             return
-        
+
         # 保存FFmpeg路径到session_state，供后续使用
         st.session_state.ffmpeg_path = ffmpeg_path
 
@@ -2542,39 +2770,55 @@ def run_video_analysis():
             st.error("模型初始化失败，请检查配置")
             return
 
-        # 确保输出目录存在
-        os.makedirs(st.session_state.keyframe_dir, exist_ok=True)
-        os.makedirs(st.session_state.cache_dir, exist_ok=True)
-        
-        # 如果使用已有关键帧，更新关键帧目录路径
-        if st.session_state.use_existing_keyframes and st.session_state.existing_keyframes_path:
-            if os.path.exists(st.session_state.existing_keyframes_path) and os.path.isdir(st.session_state.existing_keyframes_path):
-                # 验证文件夹中是否有图片
-                image_files = [f for f in os.listdir(st.session_state.existing_keyframes_path) 
-                             if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                if image_files:
-                    st.session_state.keyframe_dir = st.session_state.existing_keyframes_path
-                    st.info(f"📁 使用已有关键帧文件夹: {st.session_state.existing_keyframes_path} ({len(image_files)} 个文件)")
-                    
-                    # 提示是否启用强制重新解析
-                    if st.session_state.force_reparse_keyframes:
-                        st.warning("🔄 已启用强制重新解析，将忽略所有缓存结果，重新分析所有关键帧")
-                else:
-                    st.error(f"❌ 关键帧文件夹中没有图片文件，分析无法继续")
-                    st.session_state.processing = False
-                    return
-            else:
-                st.error(f"❌ 关键帧路径无效或不是文件夹: {st.session_state.existing_keyframes_path}")
+        # 先重置为默认关键帧目录，避免上一次外部目录残留到当前任务。
+        st.session_state.keyframe_dir = DEFAULT_KEYFRAME_DIR
+
+        # 如果使用已有关键帧，则统一走规范化和目录校验逻辑。
+        if (
+            st.session_state.use_existing_keyframes
+            and st.session_state.existing_keyframes_path
+        ):
+            normalized_keyframe_dir, image_files, keyframe_error = (
+                resolve_keyframe_directory(st.session_state.existing_keyframes_path)
+            )
+            if keyframe_error:
+                st.error(f"关键帧路径无效，无法继续分析: {keyframe_error}")
                 st.session_state.processing = False
                 return
-        
+
+            st.session_state.existing_keyframes_path = normalized_keyframe_dir
+            st.session_state.keyframe_dir = normalized_keyframe_dir
+            st.info(
+                f"📁 使用已有关键帧文件夹: {normalized_keyframe_dir} ({len(image_files)} 个文件)"
+            )
+
+            if st.session_state.force_reparse_keyframes:
+                st.warning(
+                    "🔄 已启用强制重新解析，将忽略所有缓存结果，重新分析所有关键帧"
+                )
+
+        # 在关键帧目录确定后再创建本次运行所需目录。
+        os.makedirs(st.session_state.keyframe_dir, exist_ok=True)
+        os.makedirs(st.session_state.cache_dir, exist_ok=True)
+
         # 如果使用已有向量数据库，更新向量数据库路径
-        if st.session_state.use_existing_vector_db and st.session_state.existing_vector_db_path:
-            if os.path.exists(st.session_state.existing_vector_db_path) and os.path.isdir(st.session_state.existing_vector_db_path):
-                st.session_state.vector_store_path = st.session_state.existing_vector_db_path
-                st.info(f"📚 使用已有向量数据库: {st.session_state.existing_vector_db_path}")
+        if (
+            st.session_state.use_existing_vector_db
+            and st.session_state.existing_vector_db_path
+        ):
+            if os.path.exists(
+                st.session_state.existing_vector_db_path
+            ) and os.path.isdir(st.session_state.existing_vector_db_path):
+                st.session_state.vector_store_path = (
+                    st.session_state.existing_vector_db_path
+                )
+                st.info(
+                    f"📚 使用已有向量数据库: {st.session_state.existing_vector_db_path}"
+                )
             else:
-                st.warning(f"⚠️ 向量数据库路径无效: {st.session_state.existing_vector_db_path}，将尝试重新构建")
+                st.warning(
+                    f"⚠️ 向量数据库路径无效: {st.session_state.existing_vector_db_path}，将尝试重新构建"
+                )
 
         # 初始化结果文件
         with open(st.session_state.output_file, "w", encoding="utf-8") as f:
@@ -2583,7 +2827,9 @@ def run_video_analysis():
                 f.write(f"视频文件: {st.session_state.video_path}\n")
             else:
                 f.write(f"使用已有关键帧: {st.session_state.existing_keyframes_path}\n")
-            f.write(f"使用的模型后端: {'Ollama' if st.session_state.use_ollama else '阿里云 DashScope'}\n")
+            f.write(
+                f"使用的模型后端: {'Ollama' if st.session_state.use_ollama else '阿里云 DashScope'}\n"
+            )
             if st.session_state.use_ollama:
                 f.write(f"使用的模型: {st.session_state.selected_model}\n")
             else:
@@ -2596,19 +2842,30 @@ def run_video_analysis():
 
         pipeline_start_time = time.time()
 
-        skip_extraction = st.session_state.use_existing_keyframes and st.session_state.existing_keyframes_path
-        has_video_for_asr = st.session_state.video_path and os.path.exists(st.session_state.video_path)
+        skip_extraction = (
+            st.session_state.use_existing_keyframes
+            and st.session_state.existing_keyframes_path
+        )
+        has_video_for_asr = st.session_state.video_path and os.path.exists(
+            st.session_state.video_path
+        )
 
         asr_result = {"transcription": None, "error": None}
         extraction_result = {"count": 0, "finished": False, "error": None}
-        vlm_state = {"results": {}, "processed": 0, "discovered": 0, "finished": False, "error": None}
-        
+        vlm_state = {
+            "results": {},
+            "processed": 0,
+            "discovered": 0,
+            "finished": False,
+            "error": None,
+        }
+
         def asr_worker(video_path, model_obj):
             """语音识别工作线程函数"""
             if not model_obj:
                 asr_result["error"] = "FunASR模型未初始化"
                 return
-                
+
             try:
                 print("[ASR] 🎤 语音识别线程已启动...")
                 # 提取音频
@@ -2619,54 +2876,58 @@ def run_video_analysis():
 
                 # 转录音频（直接使用传入的模型对象，不访问session_state）
                 result = model_obj.generate(
-                    input=audio_path,
-                    cache={},
-                    language="auto",
-                    use_itn=True
+                    input=audio_path, cache={}, language="auto", use_itn=True
                 )
-                
+
                 if result and len(result) > 0:
                     asr_result["transcription"] = result[0]["text"]
                     print("[ASR] ✅ 语音识别完成！")
                 else:
                     asr_result["error"] = "未检测到语音内容"
-                
+
                 # 清理临时音频文件
                 try:
                     if os.path.exists(audio_path):
                         os.remove(audio_path)
                 except:
                     pass
-                    
+
             except Exception as e:
                 asr_result["error"] = f"语音识别错误: {str(e)}"
                 import traceback
+
                 print(traceback.format_exc())
-        
+
         def extraction_worker(video_path, output_dir):
             """关键帧提取工作线程函数 - 带心跳监控的版本"""
             try:
                 print("[抽帧] 🎬 关键帧提取线程已启动...")
-                
+
                 # 初始化心跳监控
                 extraction_result["last_heartbeat"] = time.time()
                 extraction_result["heartbeat_count"] = 0
-                
+
                 # 使用带心跳监控的关键帧提取函数
-                count = extract_keyframes_with_heartbeat(video_path, output_dir, extraction_result)
-                
+                count = extract_keyframes_with_heartbeat(
+                    video_path, output_dir, extraction_result
+                )
+
                 extraction_result["count"] = count
                 extraction_result["finished"] = True
-                extraction_result["heartbeat_count"] = extraction_result.get("heartbeat_count", 0)
-                
-                print(f"[抽帧] ✅ 关键帧提取完成！共提取 {count} 个关键帧，心跳次数: {extraction_result['heartbeat_count']}")
-                
+                extraction_result["heartbeat_count"] = extraction_result.get(
+                    "heartbeat_count", 0
+                )
+
+                print(
+                    f"[抽帧] ✅ 关键帧提取完成！共提取 {count} 个关键帧，心跳次数: {extraction_result['heartbeat_count']}"
+                )
+
             except Exception as e:
                 print(f"[抽帧] ❌ 关键帧提取失败: {str(e)}")
                 extraction_result["count"] = 0
                 extraction_result["finished"] = True
                 extraction_result["error"] = str(e)
-        
+
         # 启动并行线程
         st.markdown("---")
         st.markdown("### 🚀 并行处理优化")
@@ -2685,14 +2946,13 @@ def run_video_analysis():
                 target=extraction_worker,
                 args=(st.session_state.video_path, st.session_state.keyframe_dir),
                 daemon=True,
-                name="Extraction-Worker"
+                name="Extraction-Worker",
             )
             extraction_thread.start()
             st.info("🎬 关键帧提取线程已启动")
         else:
             extraction_result["finished"] = True
-            existing_frames = [f for f in os.listdir(st.session_state.keyframe_dir) 
-                             if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            existing_frames = list_image_files(st.session_state.keyframe_dir)
             extraction_result["count"] = len(existing_frames)
             st.success(f"✅ 使用已有关键帧：共 {extraction_result['count']} 个")
         # 2) 再初始化ASR模型并启动ASR线程（仅在有视频文件时）
@@ -2700,7 +2960,9 @@ def run_video_analysis():
         if has_video_for_asr:
             st.info("正在初始化语音识别模型...")
             funasr_initialized = setup_funasr_model()
-            funasr_model_ref = st.session_state.funasr_model if funasr_initialized else None
+            funasr_model_ref = (
+                st.session_state.funasr_model if funasr_initialized else None
+            )
         else:
             st.info("ℹ️ 未提供视频文件，跳过语音识别")
 
@@ -2710,7 +2972,7 @@ def run_video_analysis():
                 target=asr_worker,
                 args=(st.session_state.video_path, funasr_model_ref),
                 daemon=True,
-                name="ASR-Worker"
+                name="ASR-Worker",
             )
             asr_thread.start()
             st.info("🎤 语音识别线程已启动")
@@ -2734,6 +2996,7 @@ def run_video_analysis():
 
         def run_vlm_pipeline():
             try:
+
                 async def vlm_pipeline_async():
                     max_in_flight = 1 if use_ollama else 6
                     pending = {}
@@ -2747,7 +3010,9 @@ def run_video_analysis():
 
                     while True:
                         discovered_images = get_sorted_image_files(keyframe_dir_path)
-                        discovered_filenames = [os.path.basename(p) for p in discovered_images]
+                        discovered_filenames = [
+                            os.path.basename(p) for p in discovered_images
+                        ]
 
                         vlm_state["discovered"] = len(discovered_images)
 
@@ -2755,7 +3020,10 @@ def run_video_analysis():
                             filename = os.path.basename(image_path)
                             if filename in processed_filenames:
                                 continue
-                            if any(pending_filename == filename for pending_filename in pending.values()):
+                            if any(
+                                pending_filename == filename
+                                for pending_filename in pending.values()
+                            ):
                                 continue
                             if len(pending) >= max_in_flight:
                                 break
@@ -2772,7 +3040,7 @@ def run_video_analysis():
                                     client=client,
                                     vlm_model=vlm_model,
                                     rate_limiter=shared_rate_limiter,
-                                    skip_cache=skip_cache
+                                    skip_cache=skip_cache,
                                 )
                             )
                             pending[task] = filename
@@ -2781,7 +3049,7 @@ def run_video_analysis():
                             done, _ = await asyncio.wait(
                                 pending.keys(),
                                 timeout=scan_interval,
-                                return_when=asyncio.FIRST_COMPLETED
+                                return_when=asyncio.FIRST_COMPLETED,
                             )
                             for task in done:
                                 filename = pending.pop(task, None)
@@ -2794,7 +3062,7 @@ def run_video_analysis():
                                         "filename": filename,
                                         "result": f"处理失败: {str(e)}",
                                         "cached": False,
-                                        "success": False
+                                        "success": False,
                                     }
                                 vlm_state["results"][filename] = result
                                 processed_filenames.add(filename)
@@ -2803,24 +3071,45 @@ def run_video_analysis():
                             await asyncio.sleep(scan_interval)
 
                         extraction_done = skip_extraction or (
-                            extraction_result.get("finished", False) and (not extraction_thread or not extraction_thread.is_alive())
+                            extraction_result.get("finished", False)
+                            and (
+                                not extraction_thread
+                                or not extraction_thread.is_alive()
+                            )
                         )
 
-                        if not extraction_done and extraction_thread and extraction_thread.is_alive():
-                            last_heartbeat = extraction_result.get("last_heartbeat", pipeline_start_time)
-                            if time.time() - last_heartbeat > heartbeat_timeout and len(discovered_images) == 0:
-                                raise TimeoutError(f"关键帧提取长时间无进展（超过 {heartbeat_timeout} 秒）")
+                        if (
+                            not extraction_done
+                            and extraction_thread
+                            and extraction_thread.is_alive()
+                        ):
+                            last_heartbeat = extraction_result.get(
+                                "last_heartbeat", pipeline_start_time
+                            )
+                            if (
+                                time.time() - last_heartbeat > heartbeat_timeout
+                                and len(discovered_images) == 0
+                            ):
+                                raise TimeoutError(
+                                    f"关键帧提取长时间无进展（超过 {heartbeat_timeout} 秒）"
+                                )
 
                         if time.time() - pipeline_start_time > max_total_time:
                             raise TimeoutError("整体处理超出最大允许时长")
 
                         if extraction_done and len(discovered_images) == 0:
                             if extraction_result.get("error"):
-                                raise RuntimeError(f"关键帧提取失败: {extraction_result['error']}")
-                            raise RuntimeError(f"在目录 {keyframe_dir_path} 中未找到任何图片")
+                                raise RuntimeError(
+                                    f"关键帧提取失败: {extraction_result['error']}"
+                                )
+                            raise RuntimeError(
+                                f"在目录 {keyframe_dir_path} 中未找到任何图片"
+                            )
 
                         if extraction_done and not pending:
-                            if len(discovered_images) == last_discovered_count and len(processed_filenames) >= len(discovered_filenames):
+                            if len(discovered_images) == last_discovered_count and len(
+                                processed_filenames
+                            ) >= len(discovered_filenames):
                                 stable_rounds += 1
                             else:
                                 stable_rounds = 0
@@ -2839,7 +3128,9 @@ def run_video_analysis():
                 vlm_state["error"] = str(e)
                 vlm_state["finished"] = True
 
-        vlm_thread = threading.Thread(target=run_vlm_pipeline, daemon=True, name="VLM-Pipeline")
+        vlm_thread = threading.Thread(
+            target=run_vlm_pipeline, daemon=True, name="VLM-Pipeline"
+        )
         vlm_thread.start()
 
         while vlm_thread.is_alive():
@@ -2858,8 +3149,14 @@ def run_video_analysis():
                 progress = processed / max(1, expected_total)
                 progress_bar.progress(min(progress, 0.99))
 
-                extraction_status = "已完成" if (skip_extraction or extraction_result.get("finished")) else "进行中"
-                status_text.text(f"VLM分析中... 已完成: {processed}/{expected_total}，关键帧提取: {extraction_status}")
+                extraction_status = (
+                    "已完成"
+                    if (skip_extraction or extraction_result.get("finished"))
+                    else "进行中"
+                )
+                status_text.text(
+                    f"VLM分析中... 已完成: {processed}/{expected_total}，关键帧提取: {extraction_status}"
+                )
 
         if vlm_state.get("error"):
             progress_bar.empty()
@@ -2875,10 +3172,10 @@ def run_video_analysis():
         status_text.empty()
 
         results = list(vlm_state["results"].values())
-        
+
         # 按帧号排序结果并显示（图+文）
         st.subheader("📊 分析结果汇总（按帧号排序）")
-        
+
         # 将结果转换为字典，按帧号排序
         result_dict = {}
         success_count = 0
@@ -2887,112 +3184,125 @@ def run_video_analysis():
             if isinstance(result, Exception):
                 st.warning(f"⚠️ 处理过程中遇到异常: {str(result)}")
                 continue
-                
+
             if isinstance(result, dict):
-                filename = result.get('filename', '')
+                filename = result.get("filename", "")
                 result_dict[filename] = result
-                if result.get('success', False):
+                if result.get("success", False):
                     success_count += 1
-        
+
         total_images = len(result_dict)
 
         # 按文件名（帧号）排序显示（图+文排布）
         sorted_filenames = sorted(result_dict.keys())
         for filename in sorted_filenames:
             result = result_dict[filename]
-            
+
             # 显示图片
             frame_num = os.path.splitext(filename)[0]
-            
+
             keyframe_path = None
             for ext in (".png", ".jpg", ".jpeg"):
-                candidate = os.path.join(st.session_state.keyframe_dir, f"{frame_num}{ext}")
+                candidate = os.path.join(
+                    st.session_state.keyframe_dir, f"{frame_num}{ext}"
+                )
                 if os.path.exists(candidate):
                     keyframe_path = candidate
                     break
-            
+
             try:
                 if keyframe_path:
                     img = Image.open(keyframe_path)
-                    st.image(img, caption=f"关键帧: {filename}", use_container_width=True)
+                    st.image(
+                        img, caption=f"关键帧: {filename}", use_container_width=True
+                    )
                 else:
                     st.warning(f"无法找到图片文件: {filename}")
             except:
                 st.warning(f"无法显示图片: {filename}")
-            
+
             # 显示分析结果
-            if result.get('success'):
+            if result.get("success"):
                 status_indicator = "✅"
-                if result.get('cached'):
+                if result.get("cached"):
                     st.success(f"{status_indicator} {filename} 分析完成 (使用缓存)")
-                elif result.get('processing_time'):
-                    st.success(f"{status_indicator} {filename} 分析完成 ({result['processing_time']:.1f}秒)")
+                elif result.get("processing_time"):
+                    st.success(
+                        f"{status_indicator} {filename} 分析完成 ({result['processing_time']:.1f}秒)"
+                    )
                 else:
                     st.success(f"{status_indicator} {filename} 分析完成")
-                
+
                 # 从缓存文件读取完整的分析结果
                 cache_file = os.path.join(cache_dir_path, f"{frame_num}.txt")
-                analysis_text = result.get('result', '')
-                
+                analysis_text = result.get("result", "")
+
                 if os.path.exists(cache_file):
                     try:
                         with open(cache_file, "r", encoding="utf-8") as f:
                             analysis_text = f.read().strip()
                     except:
                         pass
-                
-                st.markdown(f"**分析结果:**\n{analysis_text if analysis_text else '无结果'}")
+
+                st.markdown(
+                    f"**分析结果:**\n{analysis_text if analysis_text else '无结果'}"
+                )
             else:
                 st.error(f"❌ {filename} 分析失败")
                 st.markdown(f"**错误信息:**\n{result.get('result', '无结果')}")
-            
+
             st.divider()
-        
+
         st.success(f"✅ 图片分析完成！成功: {success_count}/{total_images}")
 
         # 等待ASR线程完成（在显示结果前）
         st.markdown("---")
         st.subheader("🎤 语音识别结果")
-        
+
         if asr_thread:
             st.info("⏳ 等待语音识别完成...")
             asr_thread.join(timeout=300)  # 最多等待5分钟
-            
+
             if asr_thread.is_alive():
                 st.warning("⚠️ 语音识别超时，将跳过语音转录功能")
                 asr_result["transcription"] = None
         else:
             st.info("ℹ️ 未执行语音识别（无视频文件）")
-        
+
         if asr_result.get("transcription"):
             # 显示语音识别成功
             st.success("✅ 语音转录完成！")
-            
+
             # 显示转录文本
             st.markdown("**语音转录内容:**")
             st.info(asr_result["transcription"])
-            
+
             # 保存到文件
             with open(st.session_state.output_file, "a", encoding="utf-8") as f:
                 f.write("\n语音转录结果:\n")
                 f.write("=" * 80 + "\n")
                 f.write(asr_result["transcription"] + "\n")
                 f.write("=" * 80 + "\n\n")
-            
+
             # 💡 将ASR结果保存到cache目录，使其可以被向量化和用于分析
-            asr_cache_file = os.path.join(st.session_state.cache_dir, "asr_transcription.txt")
+            asr_cache_file = os.path.join(
+                st.session_state.cache_dir, "asr_transcription.txt"
+            )
             with open(asr_cache_file, "w", encoding="utf-8") as f:
                 f.write(f"语音转录内容：{asr_result['transcription']}")
-                
+
         elif asr_result.get("error"):
             st.warning(f"⚠️ 语音转录失败: {asr_result['error']}")
         else:
             st.info("ℹ️ 视频无语音内容或语音识别被跳过")
-        
+
         st.divider()
 
         # 构建或加载向量数据库
-        if st.session_state.use_existing_vector_db and st.session_state.existing_vector_db_path:
+        if (
+            st.session_state.use_existing_vector_db
+            and st.session_state.existing_vector_db_path
+        ):
             # 使用已有向量数据库
             st.info("📚 正在加载已有向量数据库...")
             try:
@@ -3000,15 +3310,16 @@ def run_video_analysis():
                 if st.session_state.embedding_model is None:
                     st.info("正在初始化Embedding模型...")
                     st.session_state.embedding_model = load_embedding_model()
-                
+
                 if st.session_state.embedding_model:
                     # 加载已有向量数据库
                     from langchain_community.vectorstores import Chroma
+
                     st.session_state.vector_store = Chroma(
                         persist_directory=st.session_state.vector_store_path,
-                        embedding_function=st.session_state.embedding_model
+                        embedding_function=st.session_state.embedding_model,
                     )
-                    
+
                     # 验证数据库
                     try:
                         collection = st.session_state.vector_store._collection
@@ -3019,31 +3330,38 @@ def run_video_analysis():
                 else:
                     st.error("Embedding模型加载失败")
                     st.session_state.vector_store = None
-                    
+
             except Exception as e:
                 st.error(f"加载向量数据库失败: {str(e)}")
                 st.warning("将尝试重新构建向量数据库...")
-                st.session_state.vector_store = build_vector_store(st.session_state.cache_dir, force_rebuild=True)
+                st.session_state.vector_store = build_vector_store(
+                    st.session_state.cache_dir, force_rebuild=True
+                )
         else:
             # 重新构建向量数据库
             st.info("正在构建向量数据库...")
-            st.session_state.vector_store = build_vector_store(st.session_state.cache_dir, force_rebuild=True)
+            st.session_state.vector_store = build_vector_store(
+                st.session_state.cache_dir, force_rebuild=True
+            )
 
         st.success("🎉 视频分析完成！")
         st.info("💡 请切换到'多方式分析'页面查看完整报告、速读摘要和智能检索功能")
-        
+
         # Token用量已在分析前使用公式预估显示，此处不再重复
 
         # 如果使用了Ollama模型，显示停止按钮
         if st.session_state.use_ollama:
             st.session_state.ollama_used = True
             st.session_state.show_stop_button = True
-            st.warning(f"Ollama模型 {st.session_state.selected_model} 仍在运行中，可以点击下方按钮停止以释放资源")
+            st.warning(
+                f"Ollama模型 {st.session_state.selected_model} 仍在运行中，可以点击下方按钮停止以释放资源"
+            )
 
     except Exception as e:
         st.error(f"处理过程中发生错误: {str(e)}")
     finally:
         st.session_state.processing = False
+
 
 # --- Streamlit UI ---
 def video_analysis_page():
@@ -3068,19 +3386,21 @@ def video_analysis_page():
     # 侧边栏配置
     with st.sidebar:
         st.header("⚙️ 配置参数")
-        
+
         # 工作模式选择
         st.subheader("🎯 工作模式")
         work_mode = st.radio(
             "选择您的工作场景：",
             ["🆕 新视频分析", "🔄 关键帧再解析"],
-            help="新视频分析：上传视频进行完整分析\n关键帧再解析：使用已有关键帧重新分析"
+            help="新视频分析：上传视频进行完整分析\n关键帧再解析：使用已有关键帧重新分析",
         )
-        
-        is_reparse_mode = (work_mode == "🔄 关键帧再解析")
-        
+
+        is_reparse_mode = work_mode == "🔄 关键帧再解析"
+
         if is_reparse_mode:
-            st.info("💡 **关键帧再解析模式**\n\n适用场景：\n- 更换模型重新分析\n- 优化提示词\n- 对之前结果不满意")
+            st.info(
+                "💡 **关键帧再解析模式**\n\n适用场景：\n- 更换模型重新分析\n- 优化提示词\n- 对之前结果不满意"
+            )
 
         # 提示词自定义
         st.divider()
@@ -3089,39 +3409,41 @@ def video_analysis_page():
             "自定义提示词（可选）",
             value=st.session_state.user_custom_prompt,
             placeholder="在此添加您想要模型额外关注的内容或以特别格式输出结果的提示词...",
-            help="此内容将附加到基础提示词后面"
+            help="此内容将附加到基础提示词后面",
         )
 
         # 模型选择
         st.divider()
         st.subheader("🤖 模型选择")
-        model_option = st.radio("选择模型后端:",
-                              ["阿里云 DashScope", "Ollama (本地部署)"],
-                              index=0,
-                              help="阿里云需要环境变量设置API密钥，Ollama需要本地运行服务")
+        model_option = st.radio(
+            "选择模型后端:",
+            ["阿里云 DashScope", "Ollama (本地部署)"],
+            index=0,
+            help="阿里云需要环境变量设置API密钥，Ollama需要本地运行服务",
+        )
 
-        st.session_state.use_ollama = (model_option == "Ollama (本地部署)")
+        st.session_state.use_ollama = model_option == "Ollama (本地部署)"
 
         if not st.session_state.use_ollama:
             st.divider()
             st.subheader("🖼️ 视觉模型选择（VLM）")
             st.caption("用于分析图片内容")
-            
+
             vlm_options = {
                 "qwen3-vl-plus": "Qwen3-VL-Plus（新一代，更强大，略慢）",
                 "qwen-vl-plus": "Qwen-VL-Plus（推荐，速度快）",
                 "qwen-vl-max-latest": "Qwen-VL-Max Latest（最强，较慢）",
-                "qwen-vl-plus-latest": "Qwen-VL-Plus Latest（最新版）"
+                "qwen-vl-plus-latest": "Qwen-VL-Plus Latest（最新版）",
             }
-            
+
             st.session_state.vlm_model = st.selectbox(
                 "选择视觉语言模型:",
                 options=list(vlm_options.keys()),
                 format_func=lambda x: vlm_options[x],
                 index=0,
-                help="用于分析视频关键帧图片"
+                help="用于分析视频关键帧图片",
             )
-            
+
             # 从环境变量获取API密钥
             api_key = os.environ.get("DASHSCOPE_API_KEY")
             if api_key:
@@ -3141,7 +3463,7 @@ def video_analysis_page():
                     "选择Ollama模型:",
                     st.session_state.ollama_models,
                     key="selected_model",
-                    help="选择要使用的Ollama视觉模型"
+                    help="选择要使用的Ollama视觉模型",
                 )
             else:
                 st.warning("未找到任何Ollama模型，请确保Ollama服务正在运行")
@@ -3156,28 +3478,32 @@ def video_analysis_page():
             use_existing_keyframes = True
         else:
             st.subheader("🔄 重用已有数据（可选）")
-            st.caption("如果之前已经处理过视频，可以选择重用已有的关键帧和向量数据库，避免重复处理")
-            
+            st.caption(
+                "如果之前已经处理过视频，可以选择重用已有的关键帧和向量数据库，避免重复处理"
+            )
+
             # 使用已有关键帧
             use_existing_keyframes = st.checkbox(
                 "使用已有关键帧文件夹",
                 value=st.session_state.use_existing_keyframes,
-                help="选择之前已经提取过的关键帧文件夹，跳过抽帧步骤"
+                help="选择之前已经提取过的关键帧文件夹，跳过抽帧步骤",
             )
             st.session_state.use_existing_keyframes = use_existing_keyframes
-        
+
         if use_existing_keyframes:
             # 检查"过往信息"文件夹
-            history_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "过往信息")
-            
+            history_folder = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "过往信息"
+            )
+
             # 选择输入方式
             input_method = st.radio(
                 "选择输入方式：",
                 ["从过往信息文件夹选择", "手动输入路径"],
                 key="keyframe_input_method",
-                horizontal=True
+                horizontal=True,
             )
-            
+
             if input_method == "从过往信息文件夹选择":
                 # 从过往信息文件夹选择
                 if os.path.exists(history_folder):
@@ -3189,30 +3515,37 @@ def video_analysis_page():
                             if os.path.isdir(item_path):
                                 # 检查是否包含关键帧
                                 keyframe_path = os.path.join(item_path, "keyframes")
-                                if os.path.exists(keyframe_path) and os.path.isdir(keyframe_path):
-                                    # 统计图片数量
-                                    image_files = [f for f in os.listdir(keyframe_path) 
-                                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                                    if image_files:
-                                        history_items.append({
-                                            'name': item,
-                                            'path': keyframe_path,
-                                            'count': len(image_files)
-                                        })
+                                (
+                                    normalized_keyframe_path,
+                                    image_files,
+                                    keyframe_error,
+                                ) = resolve_keyframe_directory(keyframe_path)
+                                if not keyframe_error:
+                                    history_items.append(
+                                        {
+                                            "name": item,
+                                            "path": normalized_keyframe_path,
+                                            "count": len(image_files),
+                                        }
+                                    )
                     except Exception as e:
                         st.warning(f"读取过往信息文件夹时出错: {str(e)}")
-                    
+
                     if history_items:
                         # 创建选择框
                         selected_item = st.selectbox(
                             "选择历史处理记录：",
                             options=history_items,
-                            format_func=lambda x: f"{x['name']} ({x['count']} 个关键帧)",
-                            key="history_keyframe_selector"
+                            format_func=lambda x: (
+                                f"{x['name']} ({x['count']} 个关键帧)"
+                            ),
+                            key="history_keyframe_selector",
                         )
-                        
+
                         if selected_item:
-                            st.session_state.existing_keyframes_path = selected_item['path']
+                            st.session_state.existing_keyframes_path = selected_item[
+                                "path"
+                            ]
                             st.success(f"✅ 已选择: {selected_item['name']}")
                             st.info(f"📁 路径: {selected_item['path']}")
                     else:
@@ -3227,23 +3560,22 @@ def video_analysis_page():
                     "关键帧文件夹路径",
                     value=st.session_state.existing_keyframes_path,
                     placeholder="例如: keyframes 或 C:/path/to/keyframes",
-                    help="输入已有的关键帧文件夹路径（绝对路径或相对路径）"
+                    help="输入已有的关键帧文件夹路径（绝对路径或相对路径）",
                 )
                 st.session_state.existing_keyframes_path = existing_keyframes_path
-                
+
                 # 验证手动输入的路径
                 if existing_keyframes_path:
-                    if os.path.exists(existing_keyframes_path) and os.path.isdir(existing_keyframes_path):
-                        # 检查文件夹中是否有图片文件
-                        image_files = [f for f in os.listdir(existing_keyframes_path) 
-                                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                        if image_files:
-                            st.success(f"✅ 找到 {len(image_files)} 个关键帧文件")
-                        else:
-                            st.warning("⚠️ 文件夹中未找到图片文件")
+                    normalized_keyframe_path, image_files, keyframe_error = (
+                        resolve_keyframe_directory(existing_keyframes_path)
+                    )
+                    if keyframe_error:
+                        st.error(f"❌ {keyframe_error}")
                     else:
-                        st.error("❌ 路径不存在或不是文件夹")
-            
+                        st.success(f"✅ 找到 {len(image_files)} 个关键帧文件")
+                        if normalized_keyframe_path != existing_keyframes_path:
+                            st.caption(f"实际读取路径: {normalized_keyframe_path}")
+
             # 强制重新解析选项
             st.divider()
             if is_reparse_mode:
@@ -3251,7 +3583,7 @@ def video_analysis_page():
                 st.warning("🔄 **再解析模式已启用**")
                 st.caption("将忽略所有缓存结果，重新分析所有关键帧")
                 st.session_state.force_reparse_keyframes = True
-                
+
                 # 显示再解析说明
                 with st.expander("ℹ️ 关于再解析", expanded=False):
                     st.markdown("""
@@ -3271,20 +3603,20 @@ def video_analysis_page():
                 force_reparse = st.checkbox(
                     "强制重新解析关键帧",
                     value=st.session_state.force_reparse_keyframes,
-                    help="即使已有缓存结果，也强制重新分析所有关键帧。适用于更换模型、修改提示词或优化分析结果的场景。"
+                    help="即使已有缓存结果，也强制重新分析所有关键帧。适用于更换模型、修改提示词或优化分析结果的场景。",
                 )
                 st.session_state.force_reparse_keyframes = force_reparse
-                
+
                 if force_reparse:
                     st.info("🔄 将忽略已有的分析缓存，重新解析所有关键帧")
-        
+
         # 使用已有向量数据库
         if not is_reparse_mode:
             # 只在非再解析模式下显示向量数据库选项
             use_existing_vector_db = st.checkbox(
                 "使用已有向量数据库",
                 value=st.session_state.use_existing_vector_db,
-                help="选择之前已经构建的向量数据库文件夹，跳过向量构建步骤"
+                help="选择之前已经构建的向量数据库文件夹，跳过向量构建步骤",
             )
             st.session_state.use_existing_vector_db = use_existing_vector_db
         else:
@@ -3292,19 +3624,21 @@ def video_analysis_page():
             st.session_state.use_existing_vector_db = False
             use_existing_vector_db = False
             st.caption("💡 再解析模式下，将自动重新构建向量数据库以匹配新的分析结果")
-        
+
         if use_existing_vector_db:
             # 检查"过往信息"文件夹
-            history_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "过往信息")
-            
+            history_folder = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "过往信息"
+            )
+
             # 选择输入方式
             input_method_db = st.radio(
                 "选择输入方式：",
                 ["从过往信息文件夹选择", "手动输入路径"],
                 key="vector_db_input_method",
-                horizontal=True
+                horizontal=True,
             )
-            
+
             if input_method_db == "从过往信息文件夹选择":
                 # 从过往信息文件夹选择
                 if os.path.exists(history_folder):
@@ -3318,25 +3652,28 @@ def video_analysis_page():
                                 db_path = os.path.join(item_path, "chroma_db")
                                 if os.path.exists(db_path) and os.path.isdir(db_path):
                                     # 检查是否是有效的向量数据库
-                                    if os.path.exists(os.path.join(db_path, "chroma.sqlite3")):
-                                        history_db_items.append({
-                                            'name': item,
-                                            'path': db_path
-                                        })
+                                    if os.path.exists(
+                                        os.path.join(db_path, "chroma.sqlite3")
+                                    ):
+                                        history_db_items.append(
+                                            {"name": item, "path": db_path}
+                                        )
                     except Exception as e:
                         st.warning(f"读取过往信息文件夹时出错: {str(e)}")
-                    
+
                     if history_db_items:
                         # 创建选择框
                         selected_db_item = st.selectbox(
                             "选择历史向量数据库：",
                             options=history_db_items,
-                            format_func=lambda x: x['name'],
-                            key="history_vector_db_selector"
+                            format_func=lambda x: x["name"],
+                            key="history_vector_db_selector",
                         )
-                        
+
                         if selected_db_item:
-                            st.session_state.existing_vector_db_path = selected_db_item['path']
+                            st.session_state.existing_vector_db_path = selected_db_item[
+                                "path"
+                            ]
                             st.success(f"✅ 已选择: {selected_db_item['name']}")
                             st.info(f"📚 路径: {selected_db_item['path']}")
                     else:
@@ -3351,13 +3688,15 @@ def video_analysis_page():
                     "向量数据库文件夹路径",
                     value=st.session_state.existing_vector_db_path,
                     placeholder="例如: chroma_db 或 C:/path/to/chroma_db",
-                    help="输入已有的向量数据库文件夹路径（绝对路径或相对路径）"
+                    help="输入已有的向量数据库文件夹路径（绝对路径或相对路径）",
                 )
                 st.session_state.existing_vector_db_path = existing_vector_db_path
-                
+
                 # 验证手动输入的路径
                 if existing_vector_db_path:
-                    if os.path.exists(existing_vector_db_path) and os.path.isdir(existing_vector_db_path):
+                    if os.path.exists(existing_vector_db_path) and os.path.isdir(
+                        existing_vector_db_path
+                    ):
                         st.success(f"✅ 向量数据库路径有效")
                     else:
                         st.error("❌ 路径不存在或不是文件夹")
@@ -3368,7 +3707,7 @@ def video_analysis_page():
             uploaded_file = st.file_uploader(
                 "上传视频文件",
                 type=["mp4", "avi", "mov", "mkv", "flv", "wmv"],
-                help="""视频大小无上限——支持格式: mp4, avi, mov, mkv, flv, wmv"""
+                help="""视频大小无上限——支持格式: mp4, avi, mov, mkv, flv, wmv""",
             )
 
             if uploaded_file:
@@ -3381,13 +3720,15 @@ def video_analysis_page():
             # 再解析模式下不需要上传视频
             uploaded_file = None
             st.divider()
-            st.info("📌 **再解析模式下无需上传视频**\n\n系统将直接使用已选择的关键帧进行分析")
+            st.info(
+                "📌 **再解析模式下无需上传视频**\n\n系统将直接使用已选择的关键帧进行分析"
+            )
 
         # 开始分析按钮
         # 判断是否可以开始分析
         can_start = False
         disable_reason = ""
-        
+
         if st.session_state.processing:
             disable_reason = "分析进行中..."
         elif st.session_state.use_ollama and not st.session_state.selected_model:
@@ -3396,51 +3737,45 @@ def video_analysis_page():
             # 再解析模式下，检查是否选择了关键帧
             if not st.session_state.existing_keyframes_path:
                 disable_reason = "请选择要再解析的关键帧文件夹"
-            elif os.path.exists(st.session_state.existing_keyframes_path) and os.path.isdir(st.session_state.existing_keyframes_path):
-                # 检查是否有图片文件
-                try:
-                    image_files = [f for f in os.listdir(st.session_state.existing_keyframes_path) 
-                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    if image_files:
-                        can_start = True
-                    else:
-                        disable_reason = "关键帧文件夹中没有图片文件"
-                except Exception as e:
-                    disable_reason = f"无法读取关键帧文件夹: {str(e)}"
             else:
-                disable_reason = "关键帧路径不存在或不是文件夹"
+                _, _, keyframe_error = resolve_keyframe_directory(
+                    st.session_state.existing_keyframes_path
+                )
+                if keyframe_error:
+                    disable_reason = keyframe_error
+                else:
+                    can_start = True
         elif st.session_state.use_existing_keyframes:
             # 勾选了使用已有关键帧
             if not st.session_state.existing_keyframes_path:
                 disable_reason = "请输入关键帧文件夹路径"
-            elif os.path.exists(st.session_state.existing_keyframes_path) and os.path.isdir(st.session_state.existing_keyframes_path):
-                # 检查是否有图片文件
-                try:
-                    image_files = [f for f in os.listdir(st.session_state.existing_keyframes_path) 
-                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    if image_files:
-                        can_start = True
-                    else:
-                        disable_reason = "关键帧文件夹中没有图片文件"
-                except Exception as e:
-                    disable_reason = f"无法读取关键帧文件夹: {str(e)}"
             else:
-                disable_reason = "关键帧路径不存在或不是文件夹"
+                _, _, keyframe_error = resolve_keyframe_directory(
+                    st.session_state.existing_keyframes_path
+                )
+                if keyframe_error:
+                    disable_reason = keyframe_error
+                else:
+                    can_start = True
         elif uploaded_file:
             # 如果上传了视频，可以开始
             can_start = True
         else:
             disable_reason = "请上传视频或选择已有关键帧"
-        
+
         # 根据模式显示不同的按钮文本
         button_text = "🔄 开始再解析" if is_reparse_mode else "开始分析"
-        button_help = "使用当前配置重新分析所选关键帧" if is_reparse_mode else "开始视频分析处理"
-        
-        if st.button(button_text,
-                    disabled=not can_start,
-                    type="primary",
-                    use_container_width=True,
-                    help=disable_reason if not can_start else button_help):
+        button_help = (
+            "使用当前配置重新分析所选关键帧" if is_reparse_mode else "开始视频分析处理"
+        )
+
+        if st.button(
+            button_text,
+            disabled=not can_start,
+            type="primary",
+            use_container_width=True,
+            help=disable_reason if not can_start else button_help,
+        ):
             run_video_analysis()
 
         # 显示状态
@@ -3449,11 +3784,13 @@ def video_analysis_page():
 
         # 停止Ollama模型按钮
         if st.session_state.show_stop_button:
-            if st.button("停止Ollama模型",
-                        key="stop_ollama",
-                        help="停止当前运行的Ollama模型以释放系统资源",
-                        use_container_width=True,
-                        type="secondary"):
+            if st.button(
+                "停止Ollama模型",
+                key="stop_ollama",
+                help="停止当前运行的Ollama模型以释放系统资源",
+                use_container_width=True,
+                type="secondary",
+            ):
                 stop_ollama_model()
 
         st.divider()
@@ -3463,6 +3800,7 @@ def video_analysis_page():
     if st.session_state.processing:
         st.info("视频分析中，请稍候...")
 
+
 def multi_analysis_page():
     """多方式分析页面"""
     st.title("📊 多方式分析")
@@ -3470,78 +3808,78 @@ def multi_analysis_page():
     # 侧边栏配置
     with st.sidebar:
         st.header("模型配置")
-        
+
         # 模型后端选择（独立配置）
         model_option = st.radio(
             "选择模型后端:",
             ["阿里云 DashScope", "Ollama (本地部署)"],
             index=0,
             key="multi_analysis_model_backend",
-            help="选择用于生成报告和问答的模型后端"
+            help="选择用于生成报告和问答的模型后端",
         )
-        
-        st.session_state.llm_use_ollama = (model_option == "Ollama (本地部署)")
-        
+
+        st.session_state.llm_use_ollama = model_option == "Ollama (本地部署)"
+
         if not st.session_state.llm_use_ollama:
             # 阿里云配置
             api_key = os.environ.get("DASHSCOPE_API_KEY")
             if api_key:
                 st.success("✅ API密钥已配置")
-                
+
                 # 确保client已初始化（但不影响视频分析页面的配置）
                 if not st.session_state.client:
                     st.session_state.client = OpenAI(
                         api_key=api_key,
                         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
                     )
-                
+
                 st.subheader("📝 文本模型选择（LLM）")
                 st.caption("用于生成报告、摘要和问答")
-                
+
                 llm_options = {
                     "qwen-plus": "Qwen-Plus（推荐，性价比高）",
                     "qwen-max": "Qwen-Max（最强）",
                     "qwen-plus-latest": "Qwen-Plus Latest（最新版）",
                     "qwen-turbo": "Qwen-Turbo（最快，便宜）",
                     "qwen-turbo-latest": "Qwen-Turbo Latest（最新快速版）",
-                    "qwen-long": "Qwen-Long（长文本，最大1M tokens）"
+                    "qwen-long": "Qwen-Long（长文本，最大1M tokens）",
                 }
-                
+
                 st.session_state.llm_model = st.selectbox(
                     "选择文本生成模型:",
                     options=list(llm_options.keys()),
                     format_func=lambda x: llm_options[x],
                     index=0,
                     key="llm_model_selector_multi",
-                    help="用于生成报告、摘要和智能问答"
+                    help="用于生成报告、摘要和智能问答",
                 )
             else:
                 st.error("❌ 请先在环境变量中设置 DASHSCOPE_API_KEY")
         else:
             # Ollama配置
             st.subheader("Ollama 模型选择")
-            
+
             # 获取Ollama模型列表
             if st.button("刷新模型列表", key="refresh_models_multi"):
                 st.session_state.ollama_models = get_ollama_models()
-            
+
             if not st.session_state.ollama_models:
                 st.session_state.ollama_models = get_ollama_models()
-            
+
             if st.session_state.ollama_models:
                 st.session_state.llm_ollama_model = st.selectbox(
                     "选择Ollama模型:",
                     st.session_state.ollama_models,
                     key="llm_ollama_selector",
-                    help="选择要使用的Ollama模型（用于文本生成）"
+                    help="选择要使用的Ollama模型（用于文本生成）",
                 )
                 st.success(f"✅ 已选择: {st.session_state.llm_ollama_model}")
             else:
                 st.warning("未找到任何Ollama模型，请确保Ollama服务正在运行")
-        
+
         st.divider()
         st.header("向量数据库管理")
-        
+
         # Embedding模型状态
         st.subheader("🧠 Embedding模型")
         if st.session_state.embedding_model:
@@ -3549,9 +3887,9 @@ def multi_analysis_page():
         else:
             st.warning("❌ 未加载")
             st.caption("模型将在首次构建向量数据库时自动加载")
-        
+
         st.divider()
-        
+
         # 显示数据库状态
         st.subheader("📚 向量数据库")
         if st.session_state.vector_store:
@@ -3562,29 +3900,35 @@ def multi_analysis_page():
                 st.info("数据库已初始化")
         else:
             st.warning("❌ 数据库未初始化")
-        
+
         # 加载/重建数据库按钮
         col1, col2 = st.columns(2)
-        
+
         with col1:
-            if st.button("🔄 加载数据库", help="从磁盘加载已有的向量数据库", use_container_width=True):
+            if st.button(
+                "🔄 加载数据库",
+                help="从磁盘加载已有的向量数据库",
+                use_container_width=True,
+            ):
                 with st.spinner("正在加载..."):
                     st.session_state.vector_store = build_vector_store(
-                        st.session_state.cache_dir, 
-                        force_rebuild=False
+                        st.session_state.cache_dir, force_rebuild=False
                     )
                 if st.session_state.vector_store:
                     st.success("加载成功！")
                     st.rerun()
                 else:
                     st.error("加载失败，请检查是否已完成视频分析")
-        
+
         with col2:
-            if st.button("🔨 重建数据库", help="重新构建向量数据库（适用于更新了分析结果）", use_container_width=True):
+            if st.button(
+                "🔨 重建数据库",
+                help="重新构建向量数据库（适用于更新了分析结果）",
+                use_container_width=True,
+            ):
                 with st.spinner("正在重建..."):
                     st.session_state.vector_store = build_vector_store(
-                        st.session_state.cache_dir, 
-                        force_rebuild=True
+                        st.session_state.cache_dir, force_rebuild=True
                     )
                 if st.session_state.vector_store:
                     st.success("重建成功！")
@@ -3611,7 +3955,9 @@ def multi_analysis_page():
 
         if st.button("生成完整报告", key="generate_full_report"):
             with st.spinner("正在生成完整分析报告..."):
-                comprehensive_report = generate_comprehensive_report(st.session_state.cache_dir)
+                comprehensive_report = generate_comprehensive_report(
+                    st.session_state.cache_dir
+                )
 
                 # 保存完整报告
                 report_file = "完整分析报告.txt"
@@ -3634,9 +3980,9 @@ def multi_analysis_page():
                         data=f,
                         file_name=report_file,
                         mime="text/plain",
-                        use_container_width=True
+                        use_container_width=True,
                     )
-                
+
                 # Token用量仅在视频分析时使用公式预估，不在此处显示
 
     with tab2:
@@ -3662,14 +4008,14 @@ def multi_analysis_page():
                         data=f,
                         file_name=summary_file,
                         mime="text/plain",
-                        use_container_width=True
+                        use_container_width=True,
                     )
-                
+
                 # Token用量仅在视频分析时使用公式预估，不在此处显示
 
     with tab3:
         st.subheader("🔍 智能检索")
-        
+
         # 添加功能介绍
         with st.expander("📖 什么是智能检索？", expanded=False):
             st.markdown("""
@@ -3688,7 +4034,7 @@ def multi_analysis_page():
             3. 点击"🔍 检索"按钮
             4. 查看相关片段和智能回答
             """)
-        
+
         # 添加检索策略说明
         with st.expander("🎯 检索策略说明", expanded=False):
             st.markdown("""
@@ -3752,13 +4098,15 @@ def multi_analysis_page():
             | 快速查询 | 相似度搜索 |
             | 深度分析 | MMR搜索 |
             """)
-        
-        st.info("💡 提示：输入问题后点击检索，系统会自动找到最相关的视频片段并生成智能回答")
+
+        st.info(
+            "💡 提示：输入问题后点击检索，系统会自动找到最相关的视频片段并生成智能回答"
+        )
 
         # 高级检索选项（可折叠）
         with st.expander("⚙️ 高级检索选项", expanded=False):
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 search_type = st.selectbox(
                     "检索策略",
@@ -3766,43 +4114,41 @@ def multi_analysis_page():
                     format_func=lambda x: {
                         "similarity": "相似度搜索（默认）",
                         "mmr": "MMR搜索（减少冗余）",
-                        "similarity_score": "阈值搜索（过滤低相关度）"
+                        "similarity_score": "阈值搜索（过滤低相关度）",
                     }[x],
-                    help="选择不同的检索策略以优化结果"
+                    help="选择不同的检索策略以优化结果",
                 )
-                
+
                 k_results = st.slider(
                     "返回结果数量",
                     min_value=1,
                     max_value=10,
                     value=5,
-                    help="返回的相关片段数量"
+                    help="返回的相关片段数量",
                 )
-            
+
             with col2:
                 show_keyframes = st.checkbox(
-                    "显示关键帧图片",
-                    value=True,
-                    help="在结果中显示对应的关键帧图片"
+                    "显示关键帧图片", value=True, help="在结果中显示对应的关键帧图片"
                 )
-                
+
                 include_citations = st.checkbox(
-                    "包含引用信息",
-                    value=True,
-                    help="在回答中包含引用的关键帧编号"
+                    "包含引用信息", value=True, help="在回答中包含引用的关键帧编号"
                 )
 
         # 查询输入
         query = st.text_input(
-            "输入您的问题：", 
-            placeholder="例如：视频中出现了哪些人物？主要讲了什么内容？", 
-            key="rag_query"
+            "输入您的问题：",
+            placeholder="例如：视频中出现了哪些人物？主要讲了什么内容？",
+            key="rag_query",
         )
 
         # 检索按钮
         col_search, col_clear = st.columns([3, 1])
         with col_search:
-            search_clicked = st.button("🔍 检索", key="rag_search", type="primary", use_container_width=True)
+            search_clicked = st.button(
+                "🔍 检索", key="rag_search", type="primary", use_container_width=True
+            )
         with col_clear:
             if st.button("🗑️ 清空历史", key="clear_history", use_container_width=True):
                 st.session_state.query_history = []
@@ -3814,57 +4160,63 @@ def multi_analysis_page():
             if query:
                 with st.spinner("正在检索相关信息..."):
                     search_results = search_vector_store(
-                        query, 
+                        query,
                         st.session_state.vector_store,
                         k=k_results,
-                        search_type=search_type
+                        search_type=search_type,
                     )
-                    
+
                     if search_results:
                         st.success(f"✅ 找到 {len(search_results)} 条相关信息")
 
                         # 显示检索结果
                         st.markdown("### 📋 检索到的相关片段")
                         for i, doc in enumerate(search_results):
-                            frame_num = doc.metadata.get('frame', '未知')
-                            content_type = doc.metadata.get('content_type', 'visual')
-                            
+                            frame_num = doc.metadata.get("frame", "未知")
+                            content_type = doc.metadata.get("content_type", "visual")
+
                             # 根据内容类型设置标题
-                            if content_type == 'audio':
-                                title = f"片段 {i+1} - 🎤 语音转录"
+                            if content_type == "audio":
+                                title = f"片段 {i + 1} - 🎤 语音转录"
                             else:
-                                title = f"片段 {i+1} - 🖼️ 关键帧 {frame_num}"
-                            
+                                title = f"片段 {i + 1} - 🖼️ 关键帧 {frame_num}"
+
                             with st.expander(title, expanded=False):
                                 # 显示关键帧图片（仅对视觉内容）
-                                if show_keyframes and content_type == 'visual':
+                                if show_keyframes and content_type == "visual":
                                     keyframe_path = os.path.join(
-                                        st.session_state.keyframe_dir, 
-                                        f"{frame_num}.png"
+                                        st.session_state.keyframe_dir,
+                                        f"{frame_num}.png",
                                     )
                                     if os.path.exists(keyframe_path):
                                         try:
                                             img = Image.open(keyframe_path)
-                                            st.image(img, caption=f"关键帧 {frame_num}", use_container_width=True)
+                                            st.image(
+                                                img,
+                                                caption=f"关键帧 {frame_num}",
+                                                use_container_width=True,
+                                            )
                                         except:
                                             st.warning("无法加载关键帧图片")
-                                
+
                                 # 显示文本内容
-                                if content_type == 'audio':
+                                if content_type == "audio":
                                     st.markdown("**语音内容:**")
                                 else:
                                     st.markdown("**内容描述:**")
                                 st.write(doc.page_content)
-                                
+
                                 # 显示元数据
                                 metadata_info = []
-                                if doc.metadata.get('char_count'):
-                                    metadata_info.append(f"字符数: {doc.metadata['char_count']}")
-                                if content_type == 'audio':
+                                if doc.metadata.get("char_count"):
+                                    metadata_info.append(
+                                        f"字符数: {doc.metadata['char_count']}"
+                                    )
+                                if content_type == "audio":
                                     metadata_info.append("类型: 语音转录")
-                                elif content_type == 'visual':
+                                elif content_type == "visual":
                                     metadata_info.append("类型: 视觉内容")
-                                
+
                                 if metadata_info:
                                     st.caption(" | ".join(metadata_info))
 
@@ -3872,20 +4224,22 @@ def multi_analysis_page():
                         st.markdown("### 🤖 智能回答")
                         with st.spinner("正在生成回答..."):
                             response, frame_refs = generate_rag_response(
-                                query, 
+                                query,
                                 search_results,
-                                include_citations=include_citations
+                                include_citations=include_citations,
                             )
                             st.markdown(response)
-                            
+
                             # 保存到查询历史
-                            st.session_state.query_history.append({
-                                "query": query,
-                                "response": response,
-                                "frame_refs": frame_refs,
-                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
-                            })
-                            
+                            st.session_state.query_history.append(
+                                {
+                                    "query": query,
+                                    "response": response,
+                                    "frame_refs": frame_refs,
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                            )
+
                             # Token用量仅在视频分析时使用公式预估，不在此处显示
                     else:
                         st.warning("未找到相关信息，请尝试调整查询内容或检索参数")
@@ -3896,32 +4250,34 @@ def multi_analysis_page():
         if st.session_state.query_history:
             st.markdown("---")
             st.markdown("### 📝 查询历史")
-            
-            for i, history_item in enumerate(reversed(st.session_state.query_history[-5:])):
-                with st.expander(f"问题 {len(st.session_state.query_history) - i}: {history_item['query']}", expanded=False):
+
+            for i, history_item in enumerate(
+                reversed(st.session_state.query_history[-5:])
+            ):
+                with st.expander(
+                    f"问题 {len(st.session_state.query_history) - i}: {history_item['query']}",
+                    expanded=False,
+                ):
                     st.caption(f"时间: {history_item['timestamp']}")
                     st.markdown("**回答:**")
-                    st.markdown(history_item['response'])
+                    st.markdown(history_item["response"])
+
 
 def main():
     st.set_page_config(
-        page_title="视频智能分析处理套件 v3.0",
-        page_icon="🎬",
-        layout="wide"
+        page_title="视频智能分析处理套件 v3.0", page_icon="🎬", layout="wide"
     )
 
     # 页面导航
     st.sidebar.title("导航")
-    page = st.sidebar.radio(
-        "选择页面:",
-        ["视频分析", "多方式分析"]
-    )
+    page = st.sidebar.radio("选择页面:", ["视频分析", "多方式分析"])
 
     # 根据选择显示页面
     if page == "视频分析":
         video_analysis_page()
     elif page == "多方式分析":
         multi_analysis_page()
+
 
 if __name__ == "__main__":
     main()
