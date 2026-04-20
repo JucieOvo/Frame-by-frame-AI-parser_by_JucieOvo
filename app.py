@@ -1,60 +1,64 @@
-import os
-import sys
-import glob
+"""
+模块名称：app
+功能描述：
+    兼容保留的 Streamlit 页面入口文件。
+    当前版本已经将正式启动项、公共后端能力与会话状态初始化拆分到 `video_ai_suite` 包，
+    本文件暂时继续承载历史页面主体逻辑，以降低一次性重构带来的回归风险。
+
+主要组件：
+    - main: 历史 Streamlit 页面主入口。
+    - video_analysis_page: 视频分析页面。
+    - multi_analysis_page: 多方式分析页面。
+
+依赖说明：
+    - video_ai_suite.backend.runtime: 缓存环境与路径处理。
+    - video_ai_suite.backend.token_service: Token 统计计算。
+    - video_ai_suite.streamlit_app.session_state: 会话状态初始化。
+
+作者：JucieOvo
+创建日期：2026-04-20
+修改记录：
+    - 2026-04-20 JucieOvo: 接入正式拆分后的启动项、后端能力与 Streamlit 状态初始化。
+"""
+
+import asyncio
 import base64
-import time
+import glob
+import json
+import os
+import shutil
 import subprocess
+import sys
+import time
+from io import BytesIO
+from typing import List
 
-# --- 关键：在导入任何模型相关库之前，先设置环境变量 ---
-# 获取程序目录
-if getattr(sys, "frozen", False):
-    _program_dir = os.path.dirname(sys.executable)
-else:
-    _program_dir = os.path.dirname(os.path.abspath(__file__))
-
-_cache_dir = os.path.join(_program_dir, ".cache")
-
-# 强制覆盖所有可能的环境变量
-os.environ["MODELSCOPE_CACHE_DIR"] = os.path.join(_cache_dir, "modelscope", "hub")
-os.environ["MODELSCOPE_CACHE"] = os.path.join(_cache_dir, "modelscope", "hub")
-os.environ["MODELSCOPE_HOME"] = os.path.join(_cache_dir, "modelscope")
-os.environ["HF_HOME"] = os.path.join(_cache_dir, "huggingface")
-os.environ["HF_HUB_CACHE"] = os.path.join(_cache_dir, "huggingface", "hub")
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(
-    _cache_dir, "huggingface", "transformers"
+from video_ai_suite.backend.runtime import (
+    DEFAULT_KEYFRAME_DIR,
+    early_set_cache_env,
+    get_program_cache_dir,
+    list_image_files,
+    resolve_keyframe_directory,
 )
-os.environ["TORCH_HOME"] = os.path.join(_cache_dir, "torch")
+from video_ai_suite.backend.token_service import (
+    accumulate_token_usage,
+    calculate_token_cost,
+    create_empty_token_usage,
+)
 
-# 禁用自动下载
-os.environ["MODELSCOPE_SDK_DEBUG"] = "0"
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "0"
+# 必须在导入模型相关库之前先设置缓存目录，避免第三方模型库读取到用户本机旧缓存配置。
+early_set_cache_env()
 
-# 创建必要的目录
-for _dir in [
-    os.environ["MODELSCOPE_CACHE_DIR"],
-    os.environ["HF_HOME"],
-    os.environ["TRANSFORMERS_CACHE"],
-    os.environ["TORCH_HOME"],
-]:
-    os.makedirs(_dir, exist_ok=True)
-
-print(f"[INIT] 缓存目录强制设置为: {os.environ['MODELSCOPE_CACHE_DIR']}")
-
-# 现在才导入模型相关的库
 import cv2
 import numpy as np
 import ollama
-import shutil
 import streamlit as st
 from tqdm import tqdm
 from openai import OpenAI
 from PIL import Image
-from io import BytesIO
 import scenedetect
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
-import asyncio
 import aiohttp
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -66,250 +70,29 @@ from funasr import AutoModel
 from modelscope.utils.hub import snapshot_download
 from modelscope import snapshot_download as modelscope_download
 import psutil
-import json
-from typing import List
 import torch
+from video_ai_suite.streamlit_app.session_state import initialize_session_state
 
 # ollama客户端
 from ollama import Client
 
 client = Client(host="http://localhost:11434")
 
-# 关键帧图片支持的扩展名集合。
-# 统一集中定义，避免不同读取入口的过滤规则不一致。
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-DEFAULT_KEYFRAME_DIR = os.path.join(_program_dir, "keyframes")
-
-
-# 环境变量已经在文件开头设置，这里只是保留函数用于兼容性
-def get_program_cache_dir():
-    """获取程序缓存目录"""
-    return _cache_dir
-
-
-def normalize_user_path(path_value, base_dir=None):
-    """规范化用户输入路径，兼容 Unicode 字符、相对路径和常见包裹引号。"""
-    if path_value is None:
-        return ""
-
-    normalized_path = str(path_value).strip()
-    if not normalized_path:
-        return ""
-
-    quote_pairs = {'"': '"', "'": "'", "“": "”", "‘": "’"}
-    start_char = normalized_path[0]
-    end_char = normalized_path[-1]
-    if quote_pairs.get(start_char) == end_char:
-        normalized_path = normalized_path[1:-1].strip()
-
-    if not normalized_path:
-        return ""
-
-    normalized_path = os.path.expandvars(os.path.expanduser(normalized_path))
-    normalized_path = normalized_path.replace("/", os.sep).replace("\\", os.sep)
-
-    base_path = base_dir or _program_dir
-    if not os.path.isabs(normalized_path):
-        normalized_path = os.path.join(base_path, normalized_path)
-
-    return os.path.normpath(os.path.abspath(normalized_path))
-
-
-def list_image_files(directory):
-    """安全读取目录中的图片文件，避免特殊字符路径被 glob 模式误判。"""
-    normalized_dir = normalize_user_path(directory)
-    if not normalized_dir:
-        return []
-
-    image_files = []
-    try:
-        with os.scandir(normalized_dir) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS):
-                    image_files.append(entry.path)
-    except OSError as e:
-        raise OSError(f"读取目录失败: {normalized_dir}，原因: {str(e)}") from e
-
-    return image_files
-
-
-def resolve_keyframe_directory(path_value):
-    """规范化并校验关键帧目录，返回目录、图片列表和错误信息。"""
-    normalized_dir = normalize_user_path(path_value)
-    if not normalized_dir:
-        return "", [], "关键帧路径为空"
-
-    if not os.path.exists(normalized_dir):
-        return normalized_dir, [], "关键帧路径不存在"
-
-    if not os.path.isdir(normalized_dir):
-        return normalized_dir, [], "关键帧路径不是文件夹"
-
-    try:
-        image_files = list_image_files(normalized_dir)
-    except OSError as e:
-        return normalized_dir, [], str(e)
-
-    if not image_files:
-        return normalized_dir, [], "关键帧文件夹中没有图片文件"
-
-    return normalized_dir, image_files, ""
-
-
-# --- 全局声明和配置 ---
-# 使用session_state保存状态
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = None
-if "client" not in st.session_state:
-    st.session_state.client = None
-if "video_path" not in st.session_state:
-    st.session_state.video_path = None
-if "keyframe_dir" not in st.session_state:
-    st.session_state.keyframe_dir = DEFAULT_KEYFRAME_DIR
-if "output_file" not in st.session_state:
-    if getattr(sys, "frozen", False):
-        program_dir = os.path.dirname(sys.executable)
-    else:
-        program_dir = os.path.dirname(os.path.abspath(__file__))
-    st.session_state.output_file = os.path.join(program_dir, "草稿.txt")
-if "processing" not in st.session_state:
-    st.session_state.processing = False
-if "progress_bar" not in st.session_state:
-    st.session_state.progress_bar = None
-if "api_key" not in st.session_state:
-    st.session_state.api_key = None
-if "use_ollama" not in st.session_state:
-    st.session_state.use_ollama = False
-if "ollama_models" not in st.session_state:
-    st.session_state.ollama_models = []  # 存储Ollama模型列表
-if "ollama_used" not in st.session_state:
-    st.session_state.ollama_used = False  # 标记是否使用了Ollama模型
-if "show_stop_button" not in st.session_state:
-    st.session_state.show_stop_button = False  # 控制停止按钮显示
-if "user_custom_prompt" not in st.session_state:
-    st.session_state.user_custom_prompt = ""  # 用户自定义提示词
-if "funasr_model" not in st.session_state:
-    st.session_state.funasr_model = None  # FunASR模型实例
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None  # 向量数据库
-if "cache_dir" not in st.session_state:
-    if getattr(sys, "frozen", False):
-        program_dir = os.path.dirname(sys.executable)
-    else:
-        program_dir = os.path.dirname(os.path.abspath(__file__))
-    st.session_state.cache_dir = os.path.join(program_dir, "cache")  # 缓存目录
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "视频分析"  # 当前页面
-if "concurrent_queue" not in st.session_state:
-    st.session_state.concurrent_queue = asyncio.Queue()  # 并发队列
-if "query_history" not in st.session_state:
-    st.session_state.query_history = []
-if "use_existing_keyframes" not in st.session_state:
-    st.session_state.use_existing_keyframes = False
-if "existing_keyframes_path" not in st.session_state:
-    st.session_state.existing_keyframes_path = ""
-if "use_existing_vector_db" not in st.session_state:
-    st.session_state.use_existing_vector_db = False
-if "existing_vector_db_path" not in st.session_state:
-    st.session_state.existing_vector_db_path = ""  # RAG查询历史
-if "force_reparse_keyframes" not in st.session_state:
-    st.session_state.force_reparse_keyframes = False  # 强制重新解析关键帧
-if "vector_store_path" not in st.session_state:
-    if getattr(sys, "frozen", False):
-        program_dir = os.path.dirname(sys.executable)
-    else:
-        program_dir = os.path.dirname(os.path.abspath(__file__))
-    st.session_state.vector_store_path = os.path.join(
-        program_dir, "chroma_db"
-    )  # 向量数据库路径
-if "embedding_model" not in st.session_state:
-    st.session_state.embedding_model = None  # Embedding模型实例
-if "vlm_model" not in st.session_state:
-    st.session_state.vlm_model = "qwen-vl-plus"  # 视觉语言模型
-if "llm_model" not in st.session_state:
-    st.session_state.llm_model = "qwen-plus"  # 纯文本模型
-if "llm_use_ollama" not in st.session_state:
-    st.session_state.llm_use_ollama = False  # 多方式分析页面独立的Ollama标志
-if "llm_ollama_model" not in st.session_state:
-    st.session_state.llm_ollama_model = None  # 多方式分析页面的Ollama模型
-if "token_usage" not in st.session_state:
-    st.session_state.token_usage = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_cost": 0.0,
-    }  # Token使用统计
-
-
-# --- Token计费模块 ---
-def calculate_token_cost(input_tokens, output_tokens):
-    """
-    根据阶梯价格计算Token费用
-
-    阶梯价格（每千Token）：
-    输入Token：0-32K: ¥0.001, 32K-128K: ¥0.0015, 128K-256K: ¥0.003
-    输出Token：0-32K: ¥0.01, 32K-128K: ¥0.015, 128K-256K: ¥0.03
-    """
-
-    def calculate_tiered_cost(tokens, price_tiers):
-        """计算阶梯价格"""
-        cost = 0.0
-        remaining = tokens
-
-        for (tier_start, tier_end), price_per_k in price_tiers:
-            if remaining <= 0:
-                break
-
-            tier_size = tier_end - tier_start if tier_end else remaining
-            tokens_in_tier = min(remaining, tier_size)
-            cost += (tokens_in_tier / 1000) * price_per_k
-            remaining -= tokens_in_tier
-
-        return cost
-
-    # 输入Token价格阶梯（起始Token数，结束Token数）：每千Token价格
-    input_tiers = [
-        ((0, 32000), 0.001),
-        ((32000, 128000), 0.0015),
-        ((128000, 256000), 0.003),
-    ]
-
-    # 输出Token价格阶梯
-    output_tiers = [
-        ((0, 32000), 0.01),
-        ((32000, 128000), 0.015),
-        ((128000, 256000), 0.03),
-    ]
-
-    input_cost = calculate_tiered_cost(input_tokens, input_tiers)
-    output_cost = calculate_tiered_cost(output_tokens, output_tiers)
-
-    return {
-        "input_cost": input_cost,
-        "output_cost": output_cost,
-        "total_cost": input_cost + output_cost,
-    }
+initialize_session_state()
 
 
 def reset_token_usage():
-    """重置Token使用统计"""
-    st.session_state.token_usage = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_cost": 0.0,
-    }
+    """重置 Token 使用统计。"""
+    st.session_state.token_usage = create_empty_token_usage()
 
 
 def update_token_usage(input_tokens, output_tokens):
-    """更新Token使用统计"""
-    st.session_state.token_usage["input_tokens"] += input_tokens
-    st.session_state.token_usage["output_tokens"] += output_tokens
-
-    # 重新计算总费用
-    cost_info = calculate_token_cost(
-        st.session_state.token_usage["input_tokens"],
-        st.session_state.token_usage["output_tokens"],
+    """更新 Token 使用统计。"""
+    st.session_state.token_usage = accumulate_token_usage(
+        st.session_state.token_usage,
+        input_tokens,
+        output_tokens,
     )
-    st.session_state.token_usage["total_cost"] = cost_info["total_cost"]
 
 
 def display_token_usage(container=None):

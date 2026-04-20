@@ -1,0 +1,11 @@
+项目拆分方案.md
+gitignore整理方案.md
+
+# 本地模型缓存与运行产物
+.cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# 跨平台系统垃圾文件
+.DS_Store
