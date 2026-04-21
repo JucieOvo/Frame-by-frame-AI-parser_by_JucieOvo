@@ -2,7 +2,7 @@
 模块名称：checks
 功能描述：
     提供程序启动前的真实环境检查能力。
-    该模块负责检查 FFmpeg、API Key、FunASR 模型与 Embedding 模型，并在缺失时触发真实下载流程。
+    该模块负责检查 API Key、FunASR 模型与 Embedding 模型，并在缺失时触发真实下载流程。
 
 主要组件：
     - check_funasr_models: 检查 FunASR 模型完整性。
@@ -11,7 +11,6 @@
 
 依赖说明：
     - os: 路径处理。
-    - subprocess: 调用 FFmpeg 进行真实性检查。
     - video_ai_suite.bootstrap.downloads: 缺失模型时执行下载。
 
 作者：JucieOvo
@@ -23,9 +22,9 @@
 from __future__ import annotations
 
 import os
-import subprocess
 
-from video_ai_suite.backend.runtime import early_set_cache_env, get_program_cache_dir, get_program_dir
+from video_ai_suite.backend.provider_settings import get_role_providers, load_project_dotenv
+from video_ai_suite.backend.runtime import early_set_cache_env, get_program_cache_dir
 from video_ai_suite.bootstrap.downloads import download_embedding_model, download_funasr_models
 
 
@@ -96,59 +95,37 @@ def check_embedding_model() -> tuple[bool, str | None]:
     return False, None
 
 
-def check_ffmpeg() -> bool:
+def check_provider_api_keys() -> None:
     """
-    检查 FFmpeg 是否可用。
-
-    :return: FFmpeg 是否可用。
-    """
-    builtin_ffmpeg_path = os.path.join(
-        get_program_dir(),
-        "ffmpeg_downlaod",
-        "bin",
-        "ffmpeg.exe",
-    )
-
-    if os.path.exists(builtin_ffmpeg_path):
-        try:
-            subprocess.run(
-                [builtin_ffmpeg_path, "-version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
-            print(f"使用项目内置 FFmpeg: {builtin_ffmpeg_path}")
-            return True
-        except Exception:
-            print(f"项目内置 FFmpeg 不可用: {builtin_ffmpeg_path}")
-
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        print("使用系统 PATH 中的 FFmpeg")
-        return True
-    except Exception:
-        print("未检测到可用的 FFmpeg")
-        print("请先运行 setup.py 或相应环境配置脚本")
-        return False
-
-
-def check_dashscope_api_key() -> None:
-    """
-    检查阿里云 API Key。
+    按 `.env` 中实际启用的提供商动态检查所需 API Key。
 
     缺失时只输出提示，不阻断整个启动流程。
     """
-    if not os.environ.get("DASHSCOPE_API_KEY"):
-        print("未检测到 DASHSCOPE_API_KEY 环境变量")
-        print("缺少该配置将影响部分在线模型功能")
+    load_project_dotenv()
+    provider_groups: dict[str, list[str]] = {}
+
+    for role in ("vlm", "llm"):
+        for provider in get_role_providers(role):
+            api_key_env_name = str(provider.get("api_key_env_name", "")).strip()
+            if not api_key_env_name:
+                continue
+
+            provider_label = str(
+                provider.get("display_name") or provider.get("provider_id") or role
+            ).strip()
+            provider_groups.setdefault(api_key_env_name, []).append(provider_label)
+
+    if not provider_groups:
+        print("当前 .env 未声明任何需要 API Key 的模型提供商")
         return
 
-    print("DASHSCOPE_API_KEY 已配置")
+    for env_name, provider_labels in provider_groups.items():
+        providers_text = "、".join(provider_labels)
+        if os.environ.get(env_name):
+            print(f"{env_name} 已配置，关联提供商: {providers_text}")
+        else:
+            print(f"未检测到 {env_name} 环境变量，关联提供商: {providers_text}")
+            print("缺少该配置将影响对应在线模型功能")
 
 
 def check_and_prepare_environment() -> bool:
@@ -165,12 +142,8 @@ def check_and_prepare_environment() -> bool:
     cache_dir = early_set_cache_env()
     print(f"模型缓存目录: {cache_dir}")
 
-    print("\n检查 FFmpeg")
-    if not check_ffmpeg():
-        return False
-
-    print("\n检查阿里云 API Key")
-    check_dashscope_api_key()
+    print("\n检查在线模型 API Key")
+    check_provider_api_keys()
 
     print("\n检查 FunASR 语音识别模型")
     funasr_exists, _ = check_funasr_models()

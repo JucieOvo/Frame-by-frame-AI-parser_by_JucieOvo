@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 
+from video_ai_suite.bootstrap.env import load_project_dotenv
 from video_ai_suite.backend.runtime import early_set_cache_env, get_program_dir
 
 
@@ -31,6 +32,7 @@ def main() -> None:
     """
     # 统一把工作目录切回项目根，保证历史页面中依赖相对路径的读写行为继续落在项目目录。
     os.chdir(get_program_dir())
+    load_project_dotenv()
     early_set_cache_env()
 
     from video_ai_suite.streamlit_app.legacy_app import main as legacy_main

@@ -29,7 +29,20 @@ import shutil
 import sys
 from datetime import datetime
 
+from dotenv import load_dotenv
+
 from video_ai_suite.backend.runtime import early_set_cache_env, get_program_dir
+
+
+def load_project_dotenv() -> str:
+    """
+    加载项目根目录 `.env` 文件。
+
+    :return: `.env` 文件绝对路径。
+    """
+    dotenv_path = os.path.join(get_program_dir(), ".env")
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+    return dotenv_path
 
 
 def force_set_cache_env() -> str:
@@ -38,6 +51,7 @@ def force_set_cache_env() -> str:
 
     :return: 程序缓存目录路径。
     """
+    load_project_dotenv()
     return early_set_cache_env()
 
 

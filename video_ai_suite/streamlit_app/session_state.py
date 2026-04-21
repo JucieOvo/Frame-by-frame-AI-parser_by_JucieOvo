@@ -26,7 +26,11 @@ import os
 
 import streamlit as st
 
-from video_ai_suite.backend.runtime import DEFAULT_KEYFRAME_DIR, get_program_dir
+from video_ai_suite.backend.runtime import (
+    DEFAULT_KEYFRAME_DIR,
+    get_program_cache_dir,
+    get_program_dir,
+)
 from video_ai_suite.backend.token_service import create_empty_token_usage
 
 
@@ -37,6 +41,7 @@ def initialize_session_state() -> None:
     仅在键不存在时写入默认值，避免覆盖用户在当前会话中的真实操作结果。
     """
     program_dir = get_program_dir()
+    cache_root_dir = get_program_cache_dir()
     defaults = {
         "selected_model": None,
         "client": None,
@@ -53,7 +58,7 @@ def initialize_session_state() -> None:
         "user_custom_prompt": "",
         "funasr_model": None,
         "vector_store": None,
-        "cache_dir": os.path.join(program_dir, "cache"),
+        "cache_dir": os.path.join(cache_root_dir, "single", "vlm_results"),
         "current_page": "视频分析",
         "query_history": [],
         "use_existing_keyframes": False,
@@ -61,13 +66,28 @@ def initialize_session_state() -> None:
         "use_existing_vector_db": False,
         "existing_vector_db_path": "",
         "force_reparse_keyframes": False,
-        "vector_store_path": os.path.join(program_dir, "chroma_db"),
+        "vector_store_path": os.path.join(cache_root_dir, "single", "chroma_db"),
         "embedding_model": None,
-        "vlm_model": "qwen-vl-plus",
-        "llm_model": "qwen-plus",
+        "vlm_model": "",
+        "llm_model": "",
         "llm_use_ollama": False,
         "llm_ollama_model": None,
         "token_usage": create_empty_token_usage(),
+        "api_key_overrides": {},
+        "selected_vlm_endpoint_id": "",
+        "selected_llm_endpoint_id": "",
+        "batch_execution_mode": "serial",
+        "batch_max_concurrency": 1,
+        "batch_submit_interval_seconds": 0.0,
+        "batch_retry_interval_seconds": 5.0,
+        "batch_post_job_cooldown_seconds": 0.0,
+        "batch_max_retries": 0,
+        "active_batch_id": "",
+        "active_result_job_id": "",
+        "active_result_batch_id": "",
+        "batch_last_summary": None,
+        "result_jobs_cache": [],
+        "batch_status_messages": [],
     }
 
     for key, value in defaults.items():

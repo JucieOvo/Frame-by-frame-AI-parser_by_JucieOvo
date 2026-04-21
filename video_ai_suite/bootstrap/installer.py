@@ -4,12 +4,11 @@
 模块名称：installer
 功能描述：
     项目的正式安装与环境配置模块。
-    该模块承接根目录 setup.py 的全部安装职责，包括依赖安装、FFmpeg 配置、API 密钥配置与启动脚本生成。
+    该模块承接根目录 setup.py 的全部安装职责，包括依赖安装、API 密钥配置与启动脚本生成。
 
 主要组件：
     - main: 安装主入口。
     - install_requirements: 安装项目依赖。
-    - configure_ffmpeg: 配置 FFmpeg。
     - configure_api_key: 配置 API 密钥。
 
 依赖说明：
@@ -26,11 +25,9 @@ import sys
 import subprocess
 import platform
 import winreg
-import shutil
 from pathlib import Path
-import time
 
-# 项目根目录用于统一解析 requirements、FFmpeg 和生成的启动脚本位置，避免模块迁移后仍依赖当前工作目录。
+# 项目根目录用于统一解析 requirements 和生成的启动脚本位置，避免模块迁移后仍依赖当前工作目录。
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ANSI颜色代码（Windows 10+支持）
@@ -190,112 +187,9 @@ def install_requirements():
     
     return True
 
-def configure_ffmpeg():
-    """配置FFmpeg环境变量"""
-    print_header("第5步：配置 FFmpeg")
-    
-    # 检查是否已在PATH中
-    success, _, _ = run_command("ffmpeg -version", capture_output=True)
-    if success:
-        print_success("FFmpeg 已配置且可用")
-        return True
-    
-    # 查找ffmpeg文件夹
-    current_dir = PROJECT_ROOT
-    ffmpeg_source = None
-    
-    for folder_name in ["ffmpeg_downlaod", "ffmpeg_download"]:
-        folder_path = current_dir / folder_name
-        if folder_path.exists():
-            ffmpeg_exe = folder_path / "bin" / "ffmpeg.exe"
-            if ffmpeg_exe.exists():
-                ffmpeg_source = folder_path
-                print_success(f"检测到 {folder_name} 文件夹")
-                break
-    
-    if not ffmpeg_source:
-        print_warning("未找到 FFmpeg 文件夹")
-        print()
-        print_info("请确保 ffmpeg_downlaod 文件夹与此脚本在同一目录")
-        print_info("目录结构: ffmpeg_downlaod/bin/ffmpeg.exe")
-        return False
-    
-    # 获取bin目录的完整路径
-    ffmpeg_bin_path = str((ffmpeg_source / "bin").resolve())
-    
-    print()
-    print(f"📂 FFmpeg 位置信息：")
-    print(f"   当前目录: {current_dir}")
-    print(f"   FFmpeg 文件夹: {ffmpeg_source.name}")
-    print(f"   bin 目录: {ffmpeg_bin_path}")
-    print()
-    
-    # 添加到用户PATH
-    try:
-        # 打开注册表
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r'Environment',
-            0,
-            winreg.KEY_READ | winreg.KEY_WRITE
-        )
-        
-        # 读取当前PATH
-        try:
-            current_path, _ = winreg.QueryValueEx(key, 'Path')
-        except FileNotFoundError:
-            current_path = ''
-        
-        # 检查是否已存在
-        if ffmpeg_bin_path in current_path:
-            print_info("PATH 中已包含此路径")
-            print_success("FFmpeg 已配置！")
-            winreg.CloseKey(key)
-            return True
-        
-        # 添加新路径
-        if current_path and not current_path.endswith(';'):
-            new_path = f"{current_path};{ffmpeg_bin_path}"
-        else:
-            new_path = f"{current_path}{ffmpeg_bin_path}"
-        
-        # 写入注册表
-        winreg.SetValueEx(key, 'Path', 0, winreg.REG_EXPAND_SZ, new_path)
-        winreg.CloseKey(key)
-        
-        # 广播环境变量更改
-        import ctypes
-        HWND_BROADCAST = 0xFFFF
-        WM_SETTINGCHANGE = 0x1A
-        ctypes.windll.user32.SendMessageTimeoutW(
-            HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', 0, 1000, None
-        )
-        
-        print_success("成功添加到 PATH")
-        print(f"   路径: {ffmpeg_bin_path}")
-        print()
-        print_warning("重要提示：新的 PATH 需要重启命令行窗口才能生效")
-        print()
-        
-        return True
-        
-    except Exception as e:
-        print_error(f"自动配置失败: {e}")
-        print()
-        print("📝 请手动添加到环境变量：")
-        print("   1. 按 Win+R，输入: sysdm.cpl")
-        print("   2. 点击\"高级\" - \"环境变量\"")
-        print("   3. 在\"用户变量\"中找到 Path，双击")
-        print("   4. 点\"新建\"，粘贴以下路径：")
-        print(f"      {ffmpeg_bin_path}")
-        print("   5. 确定，确定，确定")
-        print()
-        input("按回车键继续...")
-        return False
-
 def configure_api_key():
     """配置API密钥"""
-    print_header("第6步：配置阿里云API密钥")
+    print_header("第5步：配置阿里云API密钥")
     
     print("阿里云API密钥用于语音识别和向量模型功能")
     print("如果没有密钥，可以跳过此步骤")
@@ -359,7 +253,7 @@ def configure_api_key():
 
 def create_run_script():
     """创建启动脚本"""
-    print_header("第7步：创建启动脚本")
+    print_header("第6步：创建启动脚本")
     
     # 创建run.bat
     bat_content = f"""@echo off
@@ -421,9 +315,8 @@ def main():
     print("  2. 升级 pip")
     print("  3. 安装 PyTorch CPU 版本")
     print("  4. 安装所有依赖包")
-    print("  5. 配置 FFmpeg")
-    print("  6. 配置 API 密钥")
-    print("  7. 创建启动脚本")
+    print("  5. 配置 API 密钥")
+    print("  6. 创建启动脚本")
     print()
     print_warning("全程需要10-30分钟，请确保网络连接稳定")
     print()
@@ -443,9 +336,7 @@ def main():
             print_warning("PyTorch 安装失败，但继续执行")
         
         install_requirements()
-        
-        configure_ffmpeg()
-        
+
         configure_api_key()
         
         create_run_script()
@@ -482,7 +373,6 @@ def main():
         print("⚠️  提示：")
         print("   - 首次运行需要下载模型（约5GB，10-30分钟）")
         print("   - 请保持网络连接稳定")
-        print("   - 如果配置了FFmpeg，需要重启命令行窗口")
         print()
         
         input("按回车键退出...")

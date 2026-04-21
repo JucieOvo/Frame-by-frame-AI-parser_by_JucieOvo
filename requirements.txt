@@ -9,7 +9,7 @@ pandas>=2.0.0
 # 视频处理 Video Processing
 opencv-python>=4.8.0
 scenedetect>=0.6.2
-ffmpeg-python>=0.2.0
+moviepy>=2.0.0
 
 # 图像处理 Image Processing
 Pillow>=10.0.0
@@ -28,8 +28,10 @@ openai>=1.0.0
 dashscope>=1.14.0
 
 # RAG和向量数据库 RAG and Vector Database
-langchain>=1.0.0
-
+langchain==1.2.15
+langchain-openai>=1.0.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
 chromadb>=0.4.0
 sentence-transformers>=2.2.0
 
@@ -46,7 +48,6 @@ stqdm>=0.0.5
 
 # 系统工具 System Tools
 psutil>=5.9.0
-requests>=2.31.0
 
 # 数据序列化 Data Serialization
 json5>=0.9.0

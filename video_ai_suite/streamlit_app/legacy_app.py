@@ -29,6 +29,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from io import BytesIO
 from typing import List
@@ -36,27 +37,48 @@ from typing import List
 from video_ai_suite.backend.runtime import (
     DEFAULT_KEYFRAME_DIR,
     early_set_cache_env,
-    get_program_dir,
     get_program_cache_dir,
     list_image_files,
     resolve_keyframe_directory,
+)
+from video_ai_suite.backend.batch_scheduler import run_batch_jobs
+from video_ai_suite.backend.job_storage import (
+    compute_uploaded_file_digest,
+    create_batch_record,
+    create_job_record,
+    get_job_paths,
+    list_batch_jobs,
+    list_result_jobs,
+    load_batch_runtime,
+    load_job_manifest,
+    load_job_state,
+    update_job_manifest,
+    update_job_state,
+    write_uploaded_file,
+)
+from video_ai_suite.backend.model_clients import invoke_text_model, invoke_vision_model
+from video_ai_suite.backend.provider_settings import (
+    get_provider_by_id,
+    get_role_providers,
+    load_project_dotenv,
 )
 from video_ai_suite.backend.token_service import (
     accumulate_token_usage,
     calculate_token_cost,
     create_empty_token_usage,
 )
+from video_ai_suite.backend.video_pipeline import run_video_job_pipeline
 
 # 必须在导入模型相关库之前先设置缓存目录，避免第三方模型库读取到用户本机旧缓存配置。
 early_set_cache_env()
+load_project_dotenv()
 
 import cv2
 import numpy as np
-import ollama
 import streamlit as st
 from tqdm import tqdm
-from openai import OpenAI
 from PIL import Image
+from moviepy import VideoFileClip
 import scenedetect
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
@@ -265,49 +287,6 @@ def show_operation_guide():
         """)
 
 
-# --- FFmpeg检查模块 ---
-def check_ffmpeg():
-    """
-    检查FFmpeg是否可用，优先使用项目内置的FFmpeg
-
-    返回:
-        bool: FFmpeg是否可用
-        str: 可用的FFmpeg路径
-    """
-    # 项目内置FFmpeg路径
-    builtin_ffmpeg_path = os.path.join(
-        get_program_dir(), "ffmpeg_downlaod", "bin", "ffmpeg.exe"
-    )
-
-    # 首先检查项目内置的FFmpeg
-    if os.path.exists(builtin_ffmpeg_path):
-        try:
-            subprocess.run(
-                [builtin_ffmpeg_path, "-version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
-            st.info(f"✅ 使用项目内置FFmpeg: {builtin_ffmpeg_path}")
-            return True, builtin_ffmpeg_path
-        except:
-            st.warning(f"⚠️ 项目内置FFmpeg不可用: {builtin_ffmpeg_path}")
-
-    # 如果项目内置FFmpeg不可用，检查系统PATH中的FFmpeg
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        st.info("✅ 使用系统PATH中的FFmpeg")
-        return True, "ffmpeg"
-    except:
-        st.error("❌ 未找到可用的FFmpeg，请确保FFmpeg已安装并添加到系统PATH")
-        return False, None
-
-
 # --- 获取Ollama模型列表 ---
 def get_ollama_models():
     """
@@ -348,34 +327,389 @@ def get_ollama_models():
             return []
 
 
+def append_batch_status_message(message: str) -> None:
+    """
+    向当前会话追加一条批量执行状态消息。
+
+    :param message: 待记录的状态消息。
+    """
+    messages = list(st.session_state.batch_status_messages)
+    messages.append(f"[{time.strftime('%H:%M:%S')}] {message}")
+    st.session_state.batch_status_messages = messages[-200:]
+
+
+def refresh_result_jobs_cache() -> list[dict]:
+    """
+    刷新会话内的可复用结果任务列表。
+
+    :return: 最新任务结果摘要列表。
+    """
+    st.session_state.result_jobs_cache = list_result_jobs()
+    return st.session_state.result_jobs_cache
+
+
+def apply_result_job_to_session(batch_id: str, job_id: str) -> None:
+    """
+    将指定任务结果目录绑定为当前会话的主分析结果目录。
+
+    :param batch_id: 批次标识。
+    :param job_id: 任务标识。
+    """
+    job_manifest = load_job_manifest(batch_id, job_id)
+    if not job_manifest:
+        return
+
+    job_state = load_job_state(batch_id, job_id)
+    paths = dict(job_manifest.get("paths", {}))
+    for key, value in job_state.get("artifacts", {}).items():
+        if isinstance(value, str) and value:
+            paths[key] = value
+
+    st.session_state.active_result_batch_id = batch_id
+    st.session_state.active_result_job_id = job_id
+    st.session_state.cache_dir = paths.get("cache_dir", st.session_state.cache_dir)
+    st.session_state.keyframe_dir = paths.get("keyframe_dir", st.session_state.keyframe_dir)
+    st.session_state.output_file = paths.get("output_file", st.session_state.output_file)
+    st.session_state.vector_store_path = paths.get(
+        "vector_store_path", st.session_state.vector_store_path
+    )
+    st.session_state.vector_store = None
+
+
+def get_current_vlm_endpoint() -> dict | None:
+    """
+    获取当前选中的视觉模型端点。
+
+    :return: 视觉端点配置。
+    """
+    if not st.session_state.selected_vlm_endpoint_id:
+        return None
+    return get_provider_by_id("vlm", st.session_state.selected_vlm_endpoint_id)
+
+
+def get_current_llm_endpoint() -> dict | None:
+    """
+    获取当前选中的文本模型端点。
+
+    :return: 文本端点配置。
+    """
+    if not st.session_state.selected_llm_endpoint_id:
+        return None
+    return get_provider_by_id("llm", st.session_state.selected_llm_endpoint_id)
+
+
+def get_selected_vlm_model_name() -> str:
+    """
+    获取当前会话实际使用的视觉模型名称。
+
+    :return: 视觉模型名称。
+    """
+    return str(st.session_state.vlm_model or "").strip()
+
+
+def get_selected_llm_model_name() -> str:
+    """
+    获取当前会话实际使用的文本模型名称。
+
+    :return: 文本模型名称。
+    """
+    return str(st.session_state.llm_model or "").strip()
+
+
+def sync_legacy_model_state_from_endpoints() -> None:
+    """
+    将新的端点选择结果同步回历史状态字段。
+
+    该同步层用于降低现有页面大量历史逻辑的改动面，
+    让旧字段继续可读，同时把真实模型调用统一切换到新的端点抽象。
+    """
+    vlm_endpoint = get_current_vlm_endpoint() or {}
+    llm_endpoint = get_current_llm_endpoint() or {}
+
+    st.session_state.use_ollama = vlm_endpoint.get("provider_type") == "ollama"
+    st.session_state.selected_model = get_selected_vlm_model_name()
+    st.session_state.llm_use_ollama = llm_endpoint.get("provider_type") == "ollama"
+
+    if st.session_state.llm_use_ollama:
+        st.session_state.llm_ollama_model = get_selected_llm_model_name()
+    else:
+        st.session_state.llm_ollama_model = None
+
+    st.session_state.client = None
+
+
+def _render_provider_selector(
+    *,
+    title: str,
+    role: str,
+    endpoint_state_key: str,
+    model_state_key: str,
+    widget_prefix: str,
+) -> None:
+    """
+    渲染基于 `.env` 的提供商选择与手动模型输入界面。
+
+    :param title: 区块标题。
+    :param role: 角色类型，仅支持 `vlm` 或 `llm`。
+    :param endpoint_state_key: 端点选择会话键。
+    :param model_state_key: 模型名称会话键。
+    :param widget_prefix: 组件键前缀。
+    """
+    st.subheader(title)
+    providers = get_role_providers(role)
+    if not providers:
+        st.error(f"当前未在 .env 中配置任何 {role.upper()} 提供商")
+        return
+
+    provider_options = [None] + providers
+    provider_index = 0
+    for index, provider in enumerate(provider_options):
+        if provider and provider.get("provider_id") == st.session_state[endpoint_state_key]:
+            provider_index = index
+            break
+
+    selected_provider = st.selectbox(
+        "选择提供商",
+        options=provider_options,
+        index=provider_index,
+        key=f"{widget_prefix}_endpoint_selector",
+        format_func=lambda item: "请选择提供商" if item is None else f"{item['display_name']} [{item['provider_type']}]",
+        help="该列表完全来自项目根目录 `.env` 配置。",
+    )
+    if selected_provider is None:
+        st.session_state[endpoint_state_key] = ""
+        st.session_state[model_state_key] = st.text_input(
+            "模型名",
+            value=st.session_state[model_state_key],
+            key=f"{widget_prefix}_model_name",
+            placeholder="请先选择提供商，再填写模型名称",
+            help="模型名称由用户手动填写，不再执行模型列表自动发现。",
+            disabled=True,
+        )
+        return
+
+    st.session_state[endpoint_state_key] = selected_provider["provider_id"]
+
+    st.caption(f"端点地址: {selected_provider['base_url']}")
+    api_key_env_name = selected_provider.get("api_key_env_name", "")
+    if api_key_env_name:
+        if os.environ.get(api_key_env_name):
+            st.success(f"环境变量 {api_key_env_name} 已配置")
+        else:
+            st.warning(f"环境变量 {api_key_env_name} 未配置")
+
+    st.session_state[model_state_key] = st.text_input(
+        "模型名",
+        value=st.session_state[model_state_key],
+        key=f"{widget_prefix}_model_name",
+        placeholder="请手动输入模型名称",
+        help="模型名称由用户手动填写，不再执行模型列表自动发现。",
+    )
+
+
+def render_vlm_endpoint_selector(section_prefix: str = "vlm") -> None:
+    """
+    渲染视觉模型端点配置区。
+
+    :param section_prefix: 组件键前缀。
+    """
+    _render_provider_selector(
+        title="视觉模型端点",
+        role="vlm",
+        endpoint_state_key="selected_vlm_endpoint_id",
+        model_state_key="vlm_model",
+        widget_prefix=section_prefix,
+    )
+
+
+def render_llm_endpoint_selector(section_prefix: str = "llm") -> None:
+    """
+    渲染文本模型端点配置区。
+
+    :param section_prefix: 组件键前缀。
+    """
+    _render_provider_selector(
+        title="文本模型端点",
+        role="llm",
+        endpoint_state_key="selected_llm_endpoint_id",
+        model_state_key="llm_model",
+        widget_prefix=section_prefix,
+    )
+
+
+def prepare_single_job_runtime(
+    uploaded_file=None,
+    source_type: str = "single",
+) -> tuple[str, str, dict]:
+    """
+    为单视频分析或关键帧再解析创建任务私有运行目录。
+
+    :param uploaded_file: 可选的上传视频对象。
+    :param source_type: 任务来源类型。
+    :return: 批次标识、任务标识、任务路径字典。
+    """
+    batch_manifest = create_batch_record(
+        execution_mode="serial",
+        max_concurrency=1,
+        submit_interval_seconds=0.0,
+        retry_interval_seconds=0.0,
+        post_job_cooldown_seconds=0.0,
+        max_retries=0,
+        source_type=source_type,
+    )
+
+    original_name = uploaded_file.name if uploaded_file else f"{source_type}.mp4"
+    job_manifest = create_job_record(batch_manifest["batch_id"], original_name)
+    if uploaded_file is not None:
+        write_uploaded_file(batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file)
+        update_job_manifest(
+            batch_manifest["batch_id"],
+            job_manifest["job_id"],
+            upload_digest=compute_uploaded_file_digest(uploaded_file),
+        )
+
+    apply_result_job_to_session(batch_manifest["batch_id"], job_manifest["job_id"])
+    st.session_state.active_batch_id = batch_manifest["batch_id"]
+    return batch_manifest["batch_id"], job_manifest["job_id"], get_job_paths(
+        batch_manifest["batch_id"], job_manifest["job_id"], original_name
+    )
+
+
+def prepare_uploaded_batch_jobs(uploaded_files: list) -> tuple[dict, list[dict]]:
+    """
+    将多个上传视频写入新的批次任务目录。
+
+    :param uploaded_files: 上传文件列表。
+    :return: 批次清单与任务清单列表。
+    """
+    batch_manifest = create_batch_record(
+        execution_mode=st.session_state.batch_execution_mode,
+        max_concurrency=max(1, int(st.session_state.batch_max_concurrency)),
+        submit_interval_seconds=float(st.session_state.batch_submit_interval_seconds),
+        retry_interval_seconds=float(st.session_state.batch_retry_interval_seconds),
+        post_job_cooldown_seconds=float(st.session_state.batch_post_job_cooldown_seconds),
+        max_retries=max(0, int(st.session_state.batch_max_retries)),
+        source_type="batch_upload",
+    )
+
+    job_manifests = []
+    for uploaded_file in uploaded_files:
+        job_manifest = create_job_record(batch_manifest["batch_id"], uploaded_file.name)
+        write_uploaded_file(batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file)
+        update_job_manifest(
+            batch_manifest["batch_id"],
+            job_manifest["job_id"],
+            upload_digest=compute_uploaded_file_digest(uploaded_file),
+        )
+        job_manifests.append(load_job_manifest(batch_manifest["batch_id"], job_manifest["job_id"]))
+
+    return batch_manifest, job_manifests
+
+
+def run_batch_video_analysis(uploaded_files: list) -> dict:
+    """
+    执行批量视频分析。
+
+    :param uploaded_files: 批量上传的视频列表。
+    :return: 批次执行结果摘要。
+    """
+    vision_endpoint = get_current_vlm_endpoint()
+    vision_model = get_selected_vlm_model_name()
+    if vision_endpoint is None:
+        raise RuntimeError("未找到可用的视觉端点配置")
+    if not vision_model:
+        raise RuntimeError("未选择视觉模型")
+
+    funasr_model_ref = None
+    if uploaded_files:
+        if setup_funasr_model():
+            funasr_model_ref = st.session_state.funasr_model
+
+    batch_manifest, job_manifests = prepare_uploaded_batch_jobs(uploaded_files)
+    batch_id = batch_manifest["batch_id"]
+    st.session_state.active_batch_id = batch_id
+    st.session_state.batch_status_messages = []
+    buffered_status_messages: list[str] = []
+    buffered_status_lock = threading.Lock()
+
+    for job_manifest in job_manifests:
+        update_job_manifest(
+            batch_id,
+            job_manifest["job_id"],
+            provider_endpoint_id=vision_endpoint["provider_id"],
+            vision_model=vision_model,
+        )
+
+    def _status_callback(message: str) -> None:
+        formatted_message = f"[{time.strftime('%H:%M:%S')}] {message}"
+        with buffered_status_lock:
+            buffered_status_messages.append(formatted_message)
+
+    def _job_runner(current_batch_id: str, current_job_id: str) -> dict:
+        return run_video_job_pipeline(
+            current_batch_id,
+            current_job_id,
+            endpoint=vision_endpoint,
+            vision_model=vision_model,
+            user_prompt=st.session_state.user_custom_prompt,
+            funasr_model=funasr_model_ref,
+            api_key_overrides=st.session_state.api_key_overrides,
+        )
+
+    summary = run_batch_jobs(
+        batch_id=batch_id,
+        job_ids=[job_manifest["job_id"] for job_manifest in job_manifests],
+        job_runner=_job_runner,
+        execution_mode=st.session_state.batch_execution_mode,
+        max_concurrency=max(1, int(st.session_state.batch_max_concurrency)),
+        submit_interval_seconds=float(st.session_state.batch_submit_interval_seconds),
+        retry_interval_seconds=float(st.session_state.batch_retry_interval_seconds),
+        post_job_cooldown_seconds=float(st.session_state.batch_post_job_cooldown_seconds),
+        max_retries=max(0, int(st.session_state.batch_max_retries)),
+        status_callback=_status_callback,
+    )
+
+    st.session_state.batch_status_messages = buffered_status_messages[-200:]
+    st.session_state.batch_last_summary = summary
+    refresh_result_jobs_cache()
+
+    if summary["success_jobs"]:
+        apply_result_job_to_session(batch_id, summary["success_jobs"][0])
+
+    return summary
+
+
 # --- 模型选择和初始化模块 ---
 def init_model():
     """初始化选择的模型"""
     try:
-        if st.session_state.use_ollama:
-            # 检查是否已选择模型
-            if not st.session_state.selected_model:
-                st.error("请先选择一个Ollama模型")
-                return False
-            st.success(f"已选择 Ollama 模型: {st.session_state.selected_model}")
-            return True
-        else:
-            # 从环境变量获取API密钥
-            st.session_state.api_key = os.environ.get("DASHSCOPE_API_KEY")
-            if not st.session_state.api_key:
-                st.error("请先在环境变量中设置 DASHSCOPE_API_KEY")
-                return False
+        sync_legacy_model_state_from_endpoints()
+        vlm_endpoint = get_current_vlm_endpoint()
+        selected_model_name = get_selected_vlm_model_name()
 
-            # 初始化阿里云客户端
-            st.session_state.client = OpenAI(
-                api_key=st.session_state.api_key,
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-            )
-            # 图片分析使用VLM模型
-            st.session_state.selected_model = st.session_state.vlm_model
-            st.success(f"已选择阿里云 DashScope")
-            st.info(f"视觉模型: {st.session_state.vlm_model}")
-            return True
+        if vlm_endpoint is None:
+            st.error("未找到可用的视觉端点")
+            return False
+
+        if not selected_model_name:
+            st.error("请先选择或手动填写视觉模型")
+            return False
+
+        st.session_state.selected_model = selected_model_name
+        st.session_state.use_ollama = vlm_endpoint.get("provider_type") == "ollama"
+
+        api_key_env_name = vlm_endpoint.get("api_key_env_name", "")
+        if (
+            vlm_endpoint.get("provider_type") != "ollama"
+            and api_key_env_name
+            and not os.environ.get(api_key_env_name)
+        ):
+            st.error(f"请先在 .env 或系统环境变量中提供 {api_key_env_name}")
+            return False
+
+        st.success(f"已选择端点: {vlm_endpoint['display_name']}")
+        st.info(f"视觉模型: {selected_model_name}")
+        return True
     except Exception as e:
         st.error(f"模型初始化失败: {str(e)}")
         return False
@@ -474,7 +808,7 @@ def extract_keyframes_batch(video_path, scene_info_list):
     核心优化思路：
     1. 先完成场景检测，确定所有需要提取的帧号
     2. 使用OpenCV一次性遍历视频，在对应帧号处保存
-    3. 避免多次调用FFmpeg，大幅提升速度
+    3. 避免重复打开视频文件，大幅提升速度
 
     参数:
         video_path (str): 视频文件路径
@@ -665,7 +999,7 @@ def extract_keyframes_parallel(video_path, scene_info_list):
         middle_frame = scene_info["middle_frame"]
         output_file = scene_info["output_file"]
 
-        # 使用OpenCV提取关键帧（不再使用FFmpeg）
+        # 关键帧提取统一走 OpenCV，避免额外外部工具依赖。
         try:
             # 打开视频
             cap = cv2.VideoCapture(video_path)
@@ -1336,35 +1670,33 @@ def setup_funasr_model():
 
 
 def extract_audio_from_video(video_path):
-    """从视频中提取音频"""
+    """使用 MoviePy 从视频中提取 16k WAV 音频。"""
     audio_path = video_path.replace(os.path.splitext(video_path)[1], ".wav")
-
+    video_clip = None
+    audio_clip = None
     try:
-        # 使用session_state中保存的FFmpeg路径，优先使用项目内置的FFmpeg
-        ffmpeg_cmd = st.session_state.get("ffmpeg_path", "ffmpeg")
-        command = [
-            ffmpeg_cmd,
-            "-i",
-            video_path,
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            audio_path,
-            "-y",  # 覆盖已存在的文件
-        ]
+        video_clip = VideoFileClip(video_path)
+        audio_clip = video_clip.audio
+        if audio_clip is None:
+            st.warning("当前视频未检测到可提取音频")
+            return None
 
-        subprocess.run(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        audio_clip.write_audiofile(
+            audio_path,
+            fps=16000,
+            nbytes=2,
+            codec="pcm_s16le",
+            logger=None,
         )
         return audio_path
-
     except Exception as e:
         st.error(f"音频提取失败: {e}")
         return None
+    finally:
+        if audio_clip is not None:
+            audio_clip.close()
+        if video_clip is not None:
+            video_clip.close()
 
 
 def transcribe_audio(audio_path):
@@ -1560,6 +1892,8 @@ async def process_single_image(
     success = False
     result = ""
     processing_time = 0
+    active_endpoint = get_current_vlm_endpoint() or {}
+    active_model_name = get_selected_vlm_model_name() or selected_model or vlm_model
 
     for attempt in range(max_retries):
         try:
@@ -1569,57 +1903,17 @@ async def process_single_image(
             if rate_limiter:
                 await rate_limiter.acquire()
 
-            if use_ollama:
-                # 使用 Ollama 处理（注意：ollama是同步的，在异步中调用）
-                # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: Client(host="http://localhost:11434").chat(
-                        model=selected_model,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": full_prompt,
-                                "images": [image_file],
-                            }
-                        ],
-                        options={
-                            "num_ctx": 4096,  # 明确设置上下文窗口大小
-                        },
-                    ),
-                )
-                result = response["message"]["content"]
-            else:
-                # 使用阿里云 DashScope 处理
-                mime_type = get_mime_type(image_file)
-                base64_image = read_image_as_base64(image_file)
-                if base64_image is None:
-                    raise Exception(f"无法读取或编码图片 {image_file}")
-
-                image_url = f"data:{mime_type};base64,{base64_image}"
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": full_prompt},
-                        ],
-                    }
-                ]
-
-                # 使用 aiohttp 进行异步HTTP请求（如果可能），否则用executor
-                loop = asyncio.get_event_loop()
-                completion = await loop.run_in_executor(
-                    None,
-                    lambda: client.chat.completions.create(
-                        model=vlm_model, messages=messages, stream=False
-                    ),
-                )
-                result = completion.choices[0].message.content
-
-                # 注意：不在此处更新Token统计，因为异步线程无法访问 st.session_state
-                # Token用量仅使用公式预估，不实时修改
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: invoke_vision_model(
+                    active_endpoint,
+                    active_model_name,
+                    full_prompt,
+                    image_file,
+                    st.session_state.api_key_overrides,
+                ),
+            )
 
             processing_time = time.time() - start_time
             success = True
@@ -1641,14 +1935,12 @@ async def process_single_image(
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(f"图片: {filename}\n")
         if success:
-            model_name = selected_model if use_ollama else vlm_model
-            f.write(f"使用模型: {model_name}\n")
+            f.write(f"使用模型: {active_model_name}\n")
             f.write(f"处理时间: {processing_time:.1f}秒\n")
             f.write("解析结果:\n")
             f.write(result.strip() + "\n")
         else:
-            model_name = selected_model if use_ollama else vlm_model
-            f.write(f"❌ 图片 {filename} 处理失败 (使用模型: {model_name})\n")
+            f.write(f"❌ 图片 {filename} 处理失败 (使用模型: {active_model_name})\n")
         f.write("-" * 80 + "\n")
 
     return {
@@ -1725,49 +2017,19 @@ def process_image_group(group, output_file, max_retries=3):
     success = False
     result = ""
     processing_time = 0
+    active_endpoint = get_current_vlm_endpoint() or {}
+    active_model_name = get_selected_vlm_model_name()
 
     for attempt in range(max_retries):
         try:
             start_time = time.time()
-            if st.session_state.use_ollama:
-                # 使用 Ollama 处理
-                # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
-                client = Client(host="http://localhost:11434")
-                response = client.chat(
-                    model=st.session_state.selected_model,
-                    messages=[
-                        {"role": "user", "content": full_prompt, "images": [image_file]}
-                    ],
-                    options={
-                        "num_ctx": 4096,  # 明确设置上下文窗口大小，每次独立
-                    },
-                )
-                result = response["message"]["content"]
-            else:
-                # 使用阿里云 DashScope 处理
-                mime_type = get_mime_type(image_file)
-                base64_image = read_image_as_base64(image_file)
-                if base64_image is None:
-                    raise Exception(f"无法读取或编码图片 {image_file}")
-
-                image_url = f"data:{mime_type};base64,{base64_image}"
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": full_prompt},
-                        ],
-                    }
-                ]
-                completion = st.session_state.client.chat.completions.create(
-                    model=st.session_state.vlm_model,  # 使用视觉模型
-                    messages=messages,
-                    stream=False,
-                )
-                result = completion.choices[0].message.content
-
-                # Token用量仅使用公式预估，不实时修改
+            result = invoke_vision_model(
+                active_endpoint,
+                active_model_name,
+                full_prompt,
+                image_file,
+                st.session_state.api_key_overrides,
+            )
 
             processing_time = time.time() - start_time
             success = True
@@ -1796,13 +2058,13 @@ def process_image_group(group, output_file, max_retries=3):
     with open(output_file, "a", encoding="utf-8") as f:
         f.write(f"图片: {filename}\n")
         if success:
-            f.write(f"使用模型: {st.session_state.selected_model}\n")
+            f.write(f"使用模型: {active_model_name}\n")
             f.write(f"处理时间: {processing_time:.1f}秒\n")
             f.write("解析结果:\n")
             f.write(result.strip() + "\n")
         else:
             f.write(
-                f"❌ 图片 {filename} 处理失败 (使用模型: {st.session_state.selected_model})\n"
+                f"❌ 图片 {filename} 处理失败 (使用模型: {active_model_name})\n"
             )
         f.write("-" * 80 + "\n")
 
@@ -2236,46 +2498,17 @@ def generate_rag_response(query, search_results, include_citations=True):
 请给出您的回答："""
 
     try:
-        response_text = ""
+        llm_endpoint = get_current_llm_endpoint()
+        llm_model_name = get_selected_llm_model_name()
+        if llm_endpoint is None or not llm_model_name:
+            return "错误：未配置文本端点或模型", []
 
-        # 使用多方式分析页面的独立配置
-        if st.session_state.llm_use_ollama:
-            # 使用Ollama
-            if not st.session_state.llm_ollama_model:
-                return "错误：未选择Ollama模型", []
-
-            # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
-            client = Client(host="http://localhost:11434")
-            response = client.chat(
-                model=st.session_state.llm_ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={
-                    "num_ctx": 4096,  # 明确设置上下文窗口，每次独立
-                },
-            )
-            response_text = response["message"]["content"]
-        else:
-            # 使用阿里云DashScope的LLM模型
-            if not st.session_state.client:
-                # 尝试初始化
-                api_key = os.environ.get("DASHSCOPE_API_KEY")
-                if api_key:
-                    st.session_state.client = OpenAI(
-                        api_key=api_key,
-                        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    )
-                else:
-                    return "错误：阿里云客户端未初始化，请检查API密钥", []
-
-            messages = [{"role": "user", "content": prompt}]
-            completion = st.session_state.client.chat.completions.create(
-                model=st.session_state.llm_model,  # 使用LLM模型
-                messages=messages,
-                stream=False,
-            )
-            response_text = completion.choices[0].message.content
-
-            # Token用量仅使用公式预估，不实时修改
+        response_text = invoke_text_model(
+            llm_endpoint,
+            llm_model_name,
+            prompt,
+            st.session_state.api_key_overrides,
+        )
 
         # 添加引用信息
         if include_citations:
@@ -2353,45 +2586,17 @@ def generate_comprehensive_report(cache_dir):
 
 {combined_text}"""
 
-        # 使用多方式分析页面的独立配置
-        if st.session_state.llm_use_ollama:
-            # 使用Ollama
-            if not st.session_state.llm_ollama_model:
-                return "错误：未选择Ollama模型，请在左侧边栏配置"
+        llm_endpoint = get_current_llm_endpoint()
+        llm_model_name = get_selected_llm_model_name()
+        if llm_endpoint is None or not llm_model_name:
+            return "错误：未配置文本端点或模型"
 
-            # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
-            client = Client(host="http://localhost:11434")
-            response = client.chat(
-                model=st.session_state.llm_ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={
-                    "num_ctx": 4096,  # 明确设置上下文窗口，每次独立
-                },
-            )
-            return response["message"]["content"]
-        else:
-            # 使用阿里云DashScope的LLM模型
-            if not st.session_state.client:
-                # 尝试初始化
-                api_key = os.environ.get("DASHSCOPE_API_KEY")
-                if api_key:
-                    st.session_state.client = OpenAI(
-                        api_key=api_key,
-                        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    )
-                else:
-                    return "错误：阿里云客户端未初始化，请检查API密钥或在左侧边栏配置"
-
-            messages = [{"role": "user", "content": prompt}]
-            completion = st.session_state.client.chat.completions.create(
-                model=st.session_state.llm_model,  # 使用LLM模型
-                messages=messages,
-                stream=False,
-            )
-
-            # Token用量仅使用公式预估，不实时修改
-
-            return completion.choices[0].message.content
+        return invoke_text_model(
+            llm_endpoint,
+            llm_model_name,
+            prompt,
+            st.session_state.api_key_overrides,
+        )
 
     except Exception as e:
         import traceback
@@ -2452,45 +2657,17 @@ def generate_quick_summary(cache_dir):
 
 {combined_text}"""
 
-        # 使用多方式分析页面的独立配置
-        if st.session_state.llm_use_ollama:
-            # 使用Ollama
-            if not st.session_state.llm_ollama_model:
-                return "错误：未选择Ollama模型，请在左侧边栏配置"
+        llm_endpoint = get_current_llm_endpoint()
+        llm_model_name = get_selected_llm_model_name()
+        if llm_endpoint is None or not llm_model_name:
+            return "错误：未配置文本端点或模型"
 
-            # ⚠️ 重要：每次创建全新的messages列表，确保不使用历史上下文
-            client = Client(host="http://localhost:11434")
-            response = client.chat(
-                model=st.session_state.llm_ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={
-                    "num_ctx": 8192,  # 明确设置上下文窗口，每次独立
-                },
-            )
-            return response["message"]["content"]
-        else:
-            # 使用阿里云DashScope的LLM模型
-            if not st.session_state.client:
-                # 尝试初始化
-                api_key = os.environ.get("DASHSCOPE_API_KEY")
-                if api_key:
-                    st.session_state.client = OpenAI(
-                        api_key=api_key,
-                        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    )
-                else:
-                    return "错误：阿里云客户端未初始化，请检查API密钥或在左侧边栏配置"
-
-            messages = [{"role": "user", "content": prompt}]
-            completion = st.session_state.client.chat.completions.create(
-                model=st.session_state.llm_model,  # 使用LLM模型
-                messages=messages,
-                stream=False,
-            )
-
-            # Token用量仅使用公式预估，不实时修改
-
-            return completion.choices[0].message.content
+        return invoke_text_model(
+            llm_endpoint,
+            llm_model_name,
+            prompt,
+            st.session_state.api_key_overrides,
+        )
 
     except Exception as e:
         import traceback
@@ -2533,6 +2710,25 @@ def stop_ollama_model():
 def run_video_analysis():
     """视频分析主程序"""
     st.session_state.processing = True
+    active_batch_id = st.session_state.active_batch_id
+    active_job_id = st.session_state.active_result_job_id
+
+    def mark_current_job_failed(error_message: str) -> None:
+        """将当前单视频任务写回失败状态。"""
+        if active_batch_id and active_job_id:
+            update_job_state(
+                active_batch_id,
+                active_job_id,
+                status="failed",
+                finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                error_message=error_message,
+                artifacts={
+                    "keyframe_dir": st.session_state.keyframe_dir,
+                    "cache_dir": st.session_state.cache_dir,
+                    "output_file": st.session_state.output_file,
+                    "vector_store_path": st.session_state.vector_store_path,
+                },
+            )
 
     try:
         # 重置Token使用统计（每次分析重新开始计算）
@@ -2540,22 +2736,34 @@ def run_video_analysis():
             reset_token_usage()
             st.info("💰 用量统计已启用，将在分析过程中实时显示Token使用情况")
 
-        # 检查FFmpeg
-        ffmpeg_available, ffmpeg_path = check_ffmpeg()
-        if not ffmpeg_available:
-            st.error("FFmpeg未安装或未找到，请确保FFmpeg已安装并添加到系统PATH")
-            return
-
-        # 保存FFmpeg路径到session_state，供后续使用
-        st.session_state.ffmpeg_path = ffmpeg_path
-
         # 初始化模型
         if not init_model():
+            mark_current_job_failed("模型初始化失败")
             st.error("模型初始化失败，请检查配置")
             return
 
-        # 先重置为默认关键帧目录，避免上一次外部目录残留到当前任务。
-        st.session_state.keyframe_dir = DEFAULT_KEYFRAME_DIR
+        if active_batch_id and active_job_id:
+            update_job_state(
+                active_batch_id,
+                active_job_id,
+                status="running",
+                stage="preparing",
+                started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                error_message="",
+            )
+            update_job_manifest(
+                active_batch_id,
+                active_job_id,
+                provider_endpoint_id=(get_current_vlm_endpoint() or {}).get(
+                    "provider_id", ""
+                ),
+                vision_model=get_selected_vlm_model_name(),
+                text_model=get_selected_llm_model_name(),
+            )
+
+        # 当前版本默认优先使用任务私有目录，避免不同视频之间共用全局关键帧目录。
+        if not st.session_state.keyframe_dir:
+            st.session_state.keyframe_dir = DEFAULT_KEYFRAME_DIR
 
         # 如果使用已有关键帧，则统一走规范化和目录校验逻辑。
         if (
@@ -2566,6 +2774,7 @@ def run_video_analysis():
                 resolve_keyframe_directory(st.session_state.existing_keyframes_path)
             )
             if keyframe_error:
+                mark_current_job_failed(keyframe_error)
                 st.error(f"关键帧路径无效，无法继续分析: {keyframe_error}")
                 st.session_state.processing = False
                 return
@@ -2605,20 +2814,18 @@ def run_video_analysis():
                 )
 
         # 初始化结果文件
+        vlm_endpoint = get_current_vlm_endpoint() or {}
+        llm_endpoint = get_current_llm_endpoint() or {}
         with open(st.session_state.output_file, "w", encoding="utf-8") as f:
             f.write(f"视频分析报告 - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             if st.session_state.video_path:
                 f.write(f"视频文件: {st.session_state.video_path}\n")
             else:
                 f.write(f"使用已有关键帧: {st.session_state.existing_keyframes_path}\n")
-            f.write(
-                f"使用的模型后端: {'Ollama' if st.session_state.use_ollama else '阿里云 DashScope'}\n"
-            )
-            if st.session_state.use_ollama:
-                f.write(f"使用的模型: {st.session_state.selected_model}\n")
-            else:
-                f.write(f"图片分析模型 (VLM): {st.session_state.vlm_model}\n")
-                f.write(f"文本生成模型 (LLM): {st.session_state.llm_model}\n")
+            f.write(f"视觉端点: {vlm_endpoint.get('display_name', '未配置')}\n")
+            f.write(f"视觉模型: {get_selected_vlm_model_name()}\n")
+            f.write(f"文本端点: {llm_endpoint.get('display_name', '未配置')}\n")
+            f.write(f"文本模型: {get_selected_llm_model_name()}\n")
             f.write("=" * 80 + "\n\n")
 
         import asyncio
@@ -2943,6 +3150,7 @@ def run_video_analysis():
                 )
 
         if vlm_state.get("error"):
+            mark_current_job_failed(vlm_state["error"])
             progress_bar.empty()
             status_text.empty()
             st.error(f"❌ 图片分析失败: {vlm_state['error']}")
@@ -3131,6 +3339,22 @@ def run_video_analysis():
         st.success("🎉 视频分析完成！")
         st.info("💡 请切换到'多方式分析'页面查看完整报告、速读摘要和智能检索功能")
 
+        if active_batch_id and active_job_id:
+            update_job_state(
+                active_batch_id,
+                active_job_id,
+                status="success",
+                stage="completed",
+                finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                error_message="",
+                artifacts={
+                    "keyframe_dir": st.session_state.keyframe_dir,
+                    "cache_dir": st.session_state.cache_dir,
+                    "output_file": st.session_state.output_file,
+                    "vector_store_path": st.session_state.vector_store_path,
+                },
+            )
+
         # Token用量已在分析前使用公式预估显示，此处不再重复
 
         # 如果使用了Ollama模型，显示停止按钮
@@ -3142,6 +3366,7 @@ def run_video_analysis():
             )
 
     except Exception as e:
+        mark_current_job_failed(str(e))
         st.error(f"处理过程中发生错误: {str(e)}")
     finally:
         st.session_state.processing = False
@@ -3167,416 +3392,299 @@ def video_analysis_page():
     show_important_reminder()
     show_operation_guide()
 
-    # 侧边栏配置
-    with st.sidebar:
-        st.header("⚙️ 配置参数")
+    single_uploaded_file = None
+    batch_uploaded_files = []
+    start_single_analysis = False
+    start_batch_analysis = False
 
-        # 工作模式选择
-        st.subheader("🎯 工作模式")
+    with st.sidebar:
+        st.header("配置参数")
         work_mode = st.radio(
-            "选择您的工作场景：",
-            ["🆕 新视频分析", "🔄 关键帧再解析"],
-            help="新视频分析：上传视频进行完整分析\n关键帧再解析：使用已有关键帧重新分析",
+            "工作模式",
+            ["单视频分析", "批量视频分析", "关键帧再解析"],
+            help="单视频分析用于完整处理一个视频，批量视频分析用于多视频顺序或并行处理，关键帧再解析用于重用已有关键帧。",
         )
 
-        is_reparse_mode = work_mode == "🔄 关键帧再解析"
+        is_batch_mode = work_mode == "批量视频分析"
+        is_reparse_mode = work_mode == "关键帧再解析"
 
-        if is_reparse_mode:
-            st.info(
-                "💡 **关键帧再解析模式**\n\n适用场景：\n- 更换模型重新分析\n- 优化提示词\n- 对之前结果不满意"
-            )
-
-        # 提示词自定义
         st.divider()
-        st.subheader("📝 提示词自定义")
+        st.subheader("提示词自定义")
         st.session_state.user_custom_prompt = st.text_area(
             "自定义提示词（可选）",
             value=st.session_state.user_custom_prompt,
-            placeholder="在此添加您想要模型额外关注的内容或以特别格式输出结果的提示词...",
-            help="此内容将附加到基础提示词后面",
+            placeholder="在此添加您希望模型额外关注的内容或输出格式要求。",
+            help="该内容将追加到基础提示词后面。",
         )
 
-        # 模型选择
         st.divider()
-        st.subheader("🤖 模型选择")
-        model_option = st.radio(
-            "选择模型后端:",
-            ["阿里云 DashScope", "Ollama (本地部署)"],
-            index=0,
-            help="阿里云需要环境变量设置API密钥，Ollama需要本地运行服务",
-        )
+        render_vlm_endpoint_selector("video_analysis_vlm")
 
-        st.session_state.use_ollama = model_option == "Ollama (本地部署)"
-
-        if not st.session_state.use_ollama:
+        if is_batch_mode:
             st.divider()
-            st.subheader("🖼️ 视觉模型选择（VLM）")
-            st.caption("用于分析图片内容")
-
-            vlm_options = {
-                "qwen3-vl-plus": "Qwen3-VL-Plus（新一代，更强大，略慢）",
-                "qwen-vl-plus": "Qwen-VL-Plus（推荐，速度快）",
-                "qwen-vl-max-latest": "Qwen-VL-Max Latest（最强，较慢）",
-                "qwen-vl-plus-latest": "Qwen-VL-Plus Latest（最新版）",
-            }
-
-            st.session_state.vlm_model = st.selectbox(
-                "选择视觉语言模型:",
-                options=list(vlm_options.keys()),
-                format_func=lambda x: vlm_options[x],
-                index=0,
-                help="用于分析视频关键帧图片",
+            st.subheader("批量调度参数")
+            st.session_state.batch_execution_mode = st.radio(
+                "执行模式",
+                ["serial", "parallel"],
+                index=0 if st.session_state.batch_execution_mode == "serial" else 1,
+                format_func=lambda value: "串行" if value == "serial" else "并行",
+                help="串行模式一次只处理一个视频，并行模式按设定并发数同时处理多个视频。",
+            )
+            st.session_state.batch_max_concurrency = st.number_input(
+                "单次并发视频数",
+                min_value=1,
+                max_value=16,
+                value=max(1, int(st.session_state.batch_max_concurrency)),
+                step=1,
+                help="仅在并行模式下生效，用于限制同时运行的视频任务数。",
+            )
+            st.session_state.batch_submit_interval_seconds = st.number_input(
+                "新任务提交等待时间（秒）",
+                min_value=0.0,
+                max_value=300.0,
+                value=float(st.session_state.batch_submit_interval_seconds),
+                step=1.0,
+            )
+            st.session_state.batch_retry_interval_seconds = st.number_input(
+                "失败重试等待时间（秒）",
+                min_value=0.0,
+                max_value=300.0,
+                value=float(st.session_state.batch_retry_interval_seconds),
+                step=1.0,
+            )
+            st.session_state.batch_post_job_cooldown_seconds = st.number_input(
+                "单任务完成后的冷却时间（秒）",
+                min_value=0.0,
+                max_value=300.0,
+                value=float(st.session_state.batch_post_job_cooldown_seconds),
+                step=1.0,
+            )
+            st.session_state.batch_max_retries = st.number_input(
+                "最大重试次数",
+                min_value=0,
+                max_value=10,
+                value=max(0, int(st.session_state.batch_max_retries)),
+                step=1,
             )
 
-            # 从环境变量获取API密钥
-            api_key = os.environ.get("DASHSCOPE_API_KEY")
-            if api_key:
-                st.success("✅ API密钥已配置")
-            else:
-                st.error("❌ 请先在环境变量中设置 DASHSCOPE_API_KEY")
-        else:
-            # 获取Ollama模型列表
-            if st.button("刷新模型列表", key="refresh_models"):
-                st.session_state.ollama_models = get_ollama_models()
-
-            if not st.session_state.ollama_models:
-                st.session_state.ollama_models = get_ollama_models()
-
-            if st.session_state.ollama_models:
-                st.selectbox(
-                    "选择Ollama模型:",
-                    st.session_state.ollama_models,
-                    key="selected_model",
-                    help="选择要使用的Ollama视觉模型",
-                )
-            else:
-                st.warning("未找到任何Ollama模型，请确保Ollama服务正在运行")
-
-        # 关键帧来源配置
         st.divider()
-        if is_reparse_mode:
-            st.subheader("🔄 选择要再解析的关键帧")
-            st.caption("请选择之前已经提取的关键帧文件夹")
-            # 再解析模式下，自动启用使用已有关键帧
-            st.session_state.use_existing_keyframes = True
-            use_existing_keyframes = True
-        else:
-            st.subheader("🔄 重用已有数据（可选）")
-            st.caption(
-                "如果之前已经处理过视频，可以选择重用已有的关键帧和向量数据库，避免重复处理"
+        if is_batch_mode:
+            batch_uploaded_files = st.file_uploader(
+                "上传多个视频文件",
+                type=["mp4", "avi", "mov", "mkv", "flv", "wmv"],
+                accept_multiple_files=True,
+                help="批量模式下可一次上传多个视频，系统会在启动后将每个视频写入项目 .cache 中的任务私有目录。",
             )
-
-            # 使用已有关键帧
-            use_existing_keyframes = st.checkbox(
+            if batch_uploaded_files:
+                st.success(f"已选择 {len(batch_uploaded_files)} 个视频文件")
+        elif is_reparse_mode:
+            st.session_state.use_existing_keyframes = True
+            st.session_state.force_reparse_keyframes = True
+            st.session_state.existing_keyframes_path = st.text_input(
+                "关键帧文件夹路径",
+                value=st.session_state.existing_keyframes_path,
+                placeholder="例如：F:/project/.cache/batches/.../keyframes",
+            )
+            if st.session_state.existing_keyframes_path:
+                normalized_path, image_files, keyframe_error = resolve_keyframe_directory(
+                    st.session_state.existing_keyframes_path
+                )
+                if keyframe_error:
+                    st.error(keyframe_error)
+                else:
+                    st.session_state.existing_keyframes_path = normalized_path
+                    st.success(f"找到 {len(image_files)} 个关键帧文件")
+        else:
+            st.session_state.use_existing_keyframes = st.checkbox(
                 "使用已有关键帧文件夹",
                 value=st.session_state.use_existing_keyframes,
-                help="选择之前已经提取过的关键帧文件夹，跳过抽帧步骤",
             )
-            st.session_state.use_existing_keyframes = use_existing_keyframes
-
-        if use_existing_keyframes:
-            # 检查"过往信息"文件夹
-            history_folder = os.path.join(get_program_dir(), "过往信息")
-
-            # 选择输入方式
-            input_method = st.radio(
-                "选择输入方式：",
-                ["从过往信息文件夹选择", "手动输入路径"],
-                key="keyframe_input_method",
-                horizontal=True,
-            )
-
-            if input_method == "从过往信息文件夹选择":
-                # 从过往信息文件夹选择
-                if os.path.exists(history_folder):
-                    # 获取所有子文件夹
-                    history_items = []
-                    try:
-                        for item in os.listdir(history_folder):
-                            item_path = os.path.join(history_folder, item)
-                            if os.path.isdir(item_path):
-                                # 检查是否包含关键帧
-                                keyframe_path = os.path.join(item_path, "keyframes")
-                                (
-                                    normalized_keyframe_path,
-                                    image_files,
-                                    keyframe_error,
-                                ) = resolve_keyframe_directory(keyframe_path)
-                                if not keyframe_error:
-                                    history_items.append(
-                                        {
-                                            "name": item,
-                                            "path": normalized_keyframe_path,
-                                            "count": len(image_files),
-                                        }
-                                    )
-                    except Exception as e:
-                        st.warning(f"读取过往信息文件夹时出错: {str(e)}")
-
-                    if history_items:
-                        # 创建选择框
-                        selected_item = st.selectbox(
-                            "选择历史处理记录：",
-                            options=history_items,
-                            format_func=lambda x: (
-                                f"{x['name']} ({x['count']} 个关键帧)"
-                            ),
-                            key="history_keyframe_selector",
-                        )
-
-                        if selected_item:
-                            st.session_state.existing_keyframes_path = selected_item[
-                                "path"
-                            ]
-                            st.success(f"✅ 已选择: {selected_item['name']}")
-                            st.info(f"📁 路径: {selected_item['path']}")
-                    else:
-                        st.warning("⚠️ 过往信息文件夹中没有找到包含关键帧的记录")
-                        st.caption("提示：处理过的视频会自动保存在'过往信息'文件夹中")
-                else:
-                    st.warning("⚠️ 过往信息文件夹不存在")
-                    st.caption(f"将在首次处理视频时自动创建: {history_folder}")
-            else:
-                # 手动输入路径
-                existing_keyframes_path = st.text_input(
+            if st.session_state.use_existing_keyframes:
+                st.session_state.existing_keyframes_path = st.text_input(
                     "关键帧文件夹路径",
                     value=st.session_state.existing_keyframes_path,
-                    placeholder="例如: keyframes 或 C:/path/to/keyframes",
-                    help="输入已有的关键帧文件夹路径（绝对路径或相对路径）",
+                    placeholder="例如：F:/project/.cache/batches/.../keyframes",
                 )
-                st.session_state.existing_keyframes_path = existing_keyframes_path
-
-                # 验证手动输入的路径
-                if existing_keyframes_path:
-                    normalized_keyframe_path, image_files, keyframe_error = (
-                        resolve_keyframe_directory(existing_keyframes_path)
+                if st.session_state.existing_keyframes_path:
+                    normalized_path, image_files, keyframe_error = resolve_keyframe_directory(
+                        st.session_state.existing_keyframes_path
                     )
                     if keyframe_error:
-                        st.error(f"❌ {keyframe_error}")
+                        st.error(keyframe_error)
                     else:
-                        st.success(f"✅ 找到 {len(image_files)} 个关键帧文件")
-                        if normalized_keyframe_path != existing_keyframes_path:
-                            st.caption(f"实际读取路径: {normalized_keyframe_path}")
-
-            # 强制重新解析选项
-            st.divider()
-            if is_reparse_mode:
-                # 再解析模式下，自动启用强制重新解析
-                st.warning("🔄 **再解析模式已启用**")
-                st.caption("将忽略所有缓存结果，重新分析所有关键帧")
-                st.session_state.force_reparse_keyframes = True
-
-                # 显示再解析说明
-                with st.expander("ℹ️ 关于再解析", expanded=False):
-                    st.markdown("""
-                    **再解析会做什么：**
-                    - ✅ 忽略所有已有的分析缓存
-                    - ✅ 使用当前选择的模型重新分析
-                    - ✅ 应用当前的提示词设置
-                    - ✅ 生成新的分析结果
-                    
-                    **注意事项：**
-                    - ⚠️ 使用云端API会产生新的费用
-                    - ⚠️ 本地模型免费但耗时较长
-                    - 💡 旧的分析缓存会被覆盖
-                    """)
-            else:
-                st.caption("💡 提示：如果已有解析结果，可以选择重新解析")
-                force_reparse = st.checkbox(
+                        st.session_state.existing_keyframes_path = normalized_path
+                        st.success(f"找到 {len(image_files)} 个关键帧文件")
+                st.session_state.force_reparse_keyframes = st.checkbox(
                     "强制重新解析关键帧",
                     value=st.session_state.force_reparse_keyframes,
-                    help="即使已有缓存结果，也强制重新分析所有关键帧。适用于更换模型、修改提示词或优化分析结果的场景。",
                 )
-                st.session_state.force_reparse_keyframes = force_reparse
-
-                if force_reparse:
-                    st.info("🔄 将忽略已有的分析缓存，重新解析所有关键帧")
-
-        # 使用已有向量数据库
-        if not is_reparse_mode:
-            # 只在非再解析模式下显示向量数据库选项
-            use_existing_vector_db = st.checkbox(
-                "使用已有向量数据库",
-                value=st.session_state.use_existing_vector_db,
-                help="选择之前已经构建的向量数据库文件夹，跳过向量构建步骤",
-            )
-            st.session_state.use_existing_vector_db = use_existing_vector_db
-        else:
-            # 再解析模式下，不使用已有向量数据库（因为分析结果变了）
-            st.session_state.use_existing_vector_db = False
-            use_existing_vector_db = False
-            st.caption("💡 再解析模式下，将自动重新构建向量数据库以匹配新的分析结果")
-
-        if use_existing_vector_db:
-            # 检查"过往信息"文件夹
-            history_folder = os.path.join(get_program_dir(), "过往信息")
-
-            # 选择输入方式
-            input_method_db = st.radio(
-                "选择输入方式：",
-                ["从过往信息文件夹选择", "手动输入路径"],
-                key="vector_db_input_method",
-                horizontal=True,
-            )
-
-            if input_method_db == "从过往信息文件夹选择":
-                # 从过往信息文件夹选择
-                if os.path.exists(history_folder):
-                    # 获取所有子文件夹
-                    history_db_items = []
-                    try:
-                        for item in os.listdir(history_folder):
-                            item_path = os.path.join(history_folder, item)
-                            if os.path.isdir(item_path):
-                                # 检查是否包含向量数据库
-                                db_path = os.path.join(item_path, "chroma_db")
-                                if os.path.exists(db_path) and os.path.isdir(db_path):
-                                    # 检查是否是有效的向量数据库
-                                    if os.path.exists(
-                                        os.path.join(db_path, "chroma.sqlite3")
-                                    ):
-                                        history_db_items.append(
-                                            {"name": item, "path": db_path}
-                                        )
-                    except Exception as e:
-                        st.warning(f"读取过往信息文件夹时出错: {str(e)}")
-
-                    if history_db_items:
-                        # 创建选择框
-                        selected_db_item = st.selectbox(
-                            "选择历史向量数据库：",
-                            options=history_db_items,
-                            format_func=lambda x: x["name"],
-                            key="history_vector_db_selector",
-                        )
-
-                        if selected_db_item:
-                            st.session_state.existing_vector_db_path = selected_db_item[
-                                "path"
-                            ]
-                            st.success(f"✅ 已选择: {selected_db_item['name']}")
-                            st.info(f"📚 路径: {selected_db_item['path']}")
-                    else:
-                        st.warning("⚠️ 过往信息文件夹中没有找到向量数据库")
-                        st.caption("提示：处理过的视频会自动保存在'过往信息'文件夹中")
-                else:
-                    st.warning("⚠️ 过往信息文件夹不存在")
-                    st.caption(f"将在首次处理视频时自动创建: {history_folder}")
-            else:
-                # 手动输入路径
-                existing_vector_db_path = st.text_input(
-                    "向量数据库文件夹路径",
-                    value=st.session_state.existing_vector_db_path,
-                    placeholder="例如: chroma_db 或 C:/path/to/chroma_db",
-                    help="输入已有的向量数据库文件夹路径（绝对路径或相对路径）",
-                )
-                st.session_state.existing_vector_db_path = existing_vector_db_path
-
-                # 验证手动输入的路径
-                if existing_vector_db_path:
-                    if os.path.exists(existing_vector_db_path) and os.path.isdir(
-                        existing_vector_db_path
-                    ):
-                        st.success(f"✅ 向量数据库路径有效")
-                    else:
-                        st.error("❌ 路径不存在或不是文件夹")
-
-        # 视频上传（仅在新视频分析模式下显示）
-        if not is_reparse_mode:
-            st.divider()
-            uploaded_file = st.file_uploader(
+            single_uploaded_file = st.file_uploader(
                 "上传视频文件",
                 type=["mp4", "avi", "mov", "mkv", "flv", "wmv"],
-                help="""视频大小无上限——支持格式: mp4, avi, mov, mkv, flv, wmv""",
+                help="单视频模式会在开始分析时把视频写入项目 .cache 的任务私有目录中。",
             )
-
-            if uploaded_file:
-                # 保存上传的文件
-                st.session_state.video_path = uploaded_file.name
-                with open(st.session_state.video_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                st.success(f"已上传: {uploaded_file.name}")
-        else:
-            # 再解析模式下不需要上传视频
-            uploaded_file = None
-            st.divider()
-            st.info(
-                "📌 **再解析模式下无需上传视频**\n\n系统将直接使用已选择的关键帧进行分析"
+            st.session_state.use_existing_vector_db = st.checkbox(
+                "使用已有向量数据库",
+                value=st.session_state.use_existing_vector_db,
             )
+            if st.session_state.use_existing_vector_db:
+                st.session_state.existing_vector_db_path = st.text_input(
+                    "向量数据库路径",
+                    value=st.session_state.existing_vector_db_path,
+                    placeholder="例如：F:/project/.cache/batches/.../chroma_db",
+                )
 
-        # 开始分析按钮
-        # 判断是否可以开始分析
-        can_start = False
-        disable_reason = ""
+        sync_legacy_model_state_from_endpoints()
+        current_vlm_endpoint = get_current_vlm_endpoint()
+        selected_vlm_model_name = get_selected_vlm_model_name()
+        can_start = current_vlm_endpoint is not None and bool(selected_vlm_model_name)
+        disable_reason = "请先在 .env 中配置视觉提供商并填写视觉模型名"
 
-        if st.session_state.processing:
-            disable_reason = "分析进行中..."
-        elif st.session_state.use_ollama and not st.session_state.selected_model:
-            disable_reason = "请先选择Ollama模型"
+        if is_batch_mode:
+            if not batch_uploaded_files:
+                can_start = False
+                disable_reason = "请先上传至少一个视频文件"
+            else:
+                can_start = True
+                disable_reason = ""
         elif is_reparse_mode:
-            # 再解析模式下，检查是否选择了关键帧
             if not st.session_state.existing_keyframes_path:
-                disable_reason = "请选择要再解析的关键帧文件夹"
+                can_start = False
+                disable_reason = "请先提供关键帧文件夹路径"
             else:
                 _, _, keyframe_error = resolve_keyframe_directory(
                     st.session_state.existing_keyframes_path
                 )
                 if keyframe_error:
+                    can_start = False
                     disable_reason = keyframe_error
                 else:
                     can_start = True
-        elif st.session_state.use_existing_keyframes:
-            # 勾选了使用已有关键帧
-            if not st.session_state.existing_keyframes_path:
-                disable_reason = "请输入关键帧文件夹路径"
-            else:
-                _, _, keyframe_error = resolve_keyframe_directory(
-                    st.session_state.existing_keyframes_path
-                )
-                if keyframe_error:
-                    disable_reason = keyframe_error
-                else:
-                    can_start = True
-        elif uploaded_file:
-            # 如果上传了视频，可以开始
-            can_start = True
+                    disable_reason = ""
         else:
-            disable_reason = "请上传视频或选择已有关键帧"
+            if st.session_state.use_existing_keyframes:
+                if not st.session_state.existing_keyframes_path:
+                    can_start = False
+                    disable_reason = "请输入关键帧文件夹路径"
+                else:
+                    _, _, keyframe_error = resolve_keyframe_directory(
+                        st.session_state.existing_keyframes_path
+                    )
+                    if keyframe_error:
+                        can_start = False
+                        disable_reason = keyframe_error
+                    else:
+                        can_start = True
+                        disable_reason = ""
+            elif single_uploaded_file is not None:
+                can_start = True
+                disable_reason = ""
+            else:
+                can_start = False
+                disable_reason = "请先上传视频"
 
-        # 根据模式显示不同的按钮文本
-        button_text = "🔄 开始再解析" if is_reparse_mode else "开始分析"
-        button_help = (
-            "使用当前配置重新分析所选关键帧" if is_reparse_mode else "开始视频分析处理"
-        )
+        if is_batch_mode:
+            start_batch_analysis = st.button(
+                "开始批量分析",
+                disabled=not can_start,
+                type="primary",
+                use_container_width=True,
+                help=disable_reason if not can_start else "开始批量视频解析",
+            )
+        else:
+            start_single_analysis = st.button(
+                "开始分析" if not is_reparse_mode else "开始再解析",
+                disabled=not can_start,
+                type="primary",
+                use_container_width=True,
+                help=disable_reason if not can_start else "开始执行当前任务",
+            )
 
-        if st.button(
-            button_text,
-            disabled=not can_start,
-            type="primary",
-            use_container_width=True,
-            help=disable_reason if not can_start else button_help,
-        ):
-            run_video_analysis()
-
-        # 显示状态
-        if st.session_state.processing:
-            st.warning("分析进行中，请勿关闭页面...")
-
-        # 停止Ollama模型按钮
         if st.session_state.show_stop_button:
             if st.button(
-                "停止Ollama模型",
+                "停止当前 Ollama 模型",
                 key="stop_ollama",
-                help="停止当前运行的Ollama模型以释放系统资源",
                 use_container_width=True,
-                type="secondary",
             ):
                 stop_ollama_model()
 
         st.divider()
-        st.caption("注意: 处理时间取决于视频长度和模型性能")
+        st.caption("处理时间取决于视频长度、关键帧数量和所选模型端点性能。")
 
-    # 主内容区
+    if start_single_analysis:
+        st.session_state.vector_store = None
+        if single_uploaded_file is not None and not (
+            is_reparse_mode or st.session_state.use_existing_keyframes
+        ):
+            batch_id, job_id, job_paths = prepare_single_job_runtime(
+                single_uploaded_file,
+                source_type="single_upload",
+            )
+            st.session_state.video_path = job_paths["source_video_path"]
+        else:
+            batch_id, job_id, job_paths = prepare_single_job_runtime(
+                uploaded_file=None,
+                source_type="keyframe_reparse",
+            )
+            st.session_state.video_path = None
+
+        st.session_state.active_batch_id = batch_id
+        st.session_state.keyframe_dir = job_paths["keyframe_dir"]
+        st.session_state.cache_dir = job_paths["cache_dir"]
+        st.session_state.output_file = job_paths["output_file"]
+        st.session_state.vector_store_path = job_paths["vector_store_path"]
+
+        if is_reparse_mode or st.session_state.use_existing_keyframes:
+            st.session_state.keyframe_dir = st.session_state.existing_keyframes_path
+
+        refresh_result_jobs_cache()
+        run_video_analysis()
+
+    if start_batch_analysis:
+        st.session_state.vector_store = None
+        with st.spinner("正在执行批量视频分析，请稍候..."):
+            summary = run_batch_video_analysis(batch_uploaded_files)
+        if summary["failed_jobs"]:
+            st.warning(
+                f"批量分析完成，成功 {len(summary['success_jobs'])} 个，失败 {len(summary['failed_jobs'])} 个。"
+            )
+        else:
+            st.success(f"批量分析完成，共成功处理 {len(summary['success_jobs'])} 个视频。")
+
+    if st.session_state.active_batch_id:
+        batch_runtime = load_batch_runtime(st.session_state.active_batch_id)
+        st.subheader("批次状态")
+        st.write(
+            {
+                "批次ID": st.session_state.active_batch_id,
+                "排队中": batch_runtime.get("queued_count", 0),
+                "运行中": batch_runtime.get("running_count", 0),
+                "成功": batch_runtime.get("success_count", 0),
+                "失败": batch_runtime.get("failed_count", 0),
+            }
+        )
+
+        job_rows = []
+        for job_item in list_batch_jobs(st.session_state.active_batch_id):
+            job_state = job_item.get("state", {})
+            job_rows.append(
+                {
+                    "job_id": job_item.get("job_id", ""),
+                    "文件名": job_item.get("original_name", ""),
+                    "状态": job_state.get("status", "queued"),
+                    "阶段": job_state.get("stage", "uploaded"),
+                    "重试次数": job_state.get("retry_count", 0),
+                    "错误": job_state.get("error_message", ""),
+                }
+            )
+        if job_rows:
+            st.dataframe(job_rows, use_container_width=True)
+
+    if st.session_state.batch_status_messages:
+        with st.expander("批量执行日志", expanded=False):
+            for message in st.session_state.batch_status_messages:
+                st.text(message)
+
     if st.session_state.processing:
         st.info("视频分析中，请稍候...")
 
@@ -3587,75 +3695,43 @@ def multi_analysis_page():
 
     # 侧边栏配置
     with st.sidebar:
-        st.header("模型配置")
+        st.header("结果与模型配置")
+        refresh_result_jobs_cache()
+        result_jobs = [
+            item
+            for item in st.session_state.result_jobs_cache
+            if item.get("status") == "success"
+        ]
 
-        # 模型后端选择（独立配置）
-        model_option = st.radio(
-            "选择模型后端:",
-            ["阿里云 DashScope", "Ollama (本地部署)"],
-            index=0,
-            key="multi_analysis_model_backend",
-            help="选择用于生成报告和问答的模型后端",
-        )
+        if result_jobs:
+            selected_result_index = 0
+            for index, item in enumerate(result_jobs):
+                if (
+                    item.get("batch_id") == st.session_state.active_result_batch_id
+                    and item.get("job_id") == st.session_state.active_result_job_id
+                ):
+                    selected_result_index = index
+                    break
 
-        st.session_state.llm_use_ollama = model_option == "Ollama (本地部署)"
-
-        if not st.session_state.llm_use_ollama:
-            # 阿里云配置
-            api_key = os.environ.get("DASHSCOPE_API_KEY")
-            if api_key:
-                st.success("✅ API密钥已配置")
-
-                # 确保client已初始化（但不影响视频分析页面的配置）
-                if not st.session_state.client:
-                    st.session_state.client = OpenAI(
-                        api_key=api_key,
-                        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    )
-
-                st.subheader("📝 文本模型选择（LLM）")
-                st.caption("用于生成报告、摘要和问答")
-
-                llm_options = {
-                    "qwen-plus": "Qwen-Plus（推荐，性价比高）",
-                    "qwen-max": "Qwen-Max（最强）",
-                    "qwen-plus-latest": "Qwen-Plus Latest（最新版）",
-                    "qwen-turbo": "Qwen-Turbo（最快，便宜）",
-                    "qwen-turbo-latest": "Qwen-Turbo Latest（最新快速版）",
-                    "qwen-long": "Qwen-Long（长文本，最大1M tokens）",
-                }
-
-                st.session_state.llm_model = st.selectbox(
-                    "选择文本生成模型:",
-                    options=list(llm_options.keys()),
-                    format_func=lambda x: llm_options[x],
-                    index=0,
-                    key="llm_model_selector_multi",
-                    help="用于生成报告、摘要和智能问答",
-                )
-            else:
-                st.error("❌ 请先在环境变量中设置 DASHSCOPE_API_KEY")
+            selected_result = st.selectbox(
+                "选择分析结果",
+                options=result_jobs,
+                index=selected_result_index,
+                format_func=lambda item: f"{item['original_name']} [{item['status']}]",
+                help="可在这里切换单视频或批量任务中任意一个已落盘的分析结果。",
+            )
+            apply_result_job_to_session(
+                selected_result["batch_id"],
+                selected_result["job_id"],
+            )
+            st.caption(f"关键帧目录: {st.session_state.keyframe_dir}")
+            st.caption(f"缓存目录: {st.session_state.cache_dir}")
         else:
-            # Ollama配置
-            st.subheader("Ollama 模型选择")
+            st.warning("当前没有可复用的分析结果，请先在“视频分析”页面完成至少一次处理。")
 
-            # 获取Ollama模型列表
-            if st.button("刷新模型列表", key="refresh_models_multi"):
-                st.session_state.ollama_models = get_ollama_models()
-
-            if not st.session_state.ollama_models:
-                st.session_state.ollama_models = get_ollama_models()
-
-            if st.session_state.ollama_models:
-                st.session_state.llm_ollama_model = st.selectbox(
-                    "选择Ollama模型:",
-                    st.session_state.ollama_models,
-                    key="llm_ollama_selector",
-                    help="选择要使用的Ollama模型（用于文本生成）",
-                )
-                st.success(f"✅ 已选择: {st.session_state.llm_ollama_model}")
-            else:
-                st.warning("未找到任何Ollama模型，请确保Ollama服务正在运行")
+        st.divider()
+        render_llm_endpoint_selector("multi_analysis_llm")
+        sync_legacy_model_state_from_endpoints()
 
         st.divider()
         st.header("向量数据库管理")
