@@ -2,10 +2,10 @@
 模块名称：main
 功能描述：
     Streamlit 正式入口脚本。
-    该入口不再直接承担业务逻辑，而是负责加载兼容页面入口，从而把项目的正式启动路径迁移到独立目录。
+    该入口负责直接加载包内正式页面模块，不再依赖根目录 `app.py`。
 
 主要组件：
-    - main: 加载并执行兼容页面入口。
+    - main: 加载并执行包内正式页面入口。
 
 依赖说明：
     - pathlib: 计算项目根目录。
@@ -20,35 +20,22 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import os
 
-from video_ai_suite.backend.runtime import early_set_cache_env
-
-
-def _ensure_project_root_in_sys_path() -> None:
-    """
-    将项目根目录加入模块搜索路径。
-
-    该处理用于让新的 Streamlit 入口可以继续加载当前的兼容页面模块，
-    在不一次性大搬迁页面代码的前提下，先完成入口结构的正式拆分。
-    """
-    project_root = Path(__file__).resolve().parents[2]
-    project_root_str = str(project_root)
-    if project_root_str not in sys.path:
-        sys.path.insert(0, project_root_str)
+from video_ai_suite.backend.runtime import early_set_cache_env, get_program_dir
 
 
 def main() -> None:
     """
-    执行兼容页面入口。
+    执行包内正式页面入口。
     """
+    # 统一把工作目录切回项目根，保证历史页面中依赖相对路径的读写行为继续落在项目目录。
+    os.chdir(get_program_dir())
     early_set_cache_env()
-    _ensure_project_root_in_sys_path()
 
-    import app as legacy_streamlit_app
+    from video_ai_suite.streamlit_app.legacy_app import main as legacy_main
 
-    legacy_streamlit_app.main()
+    legacy_main()
 
 
 if __name__ == "__main__":
