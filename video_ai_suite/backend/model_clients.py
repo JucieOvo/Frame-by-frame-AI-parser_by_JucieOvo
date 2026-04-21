@@ -20,6 +20,7 @@
 创建日期：2026-04-21
 修改记录：
     - 2026-04-21 JucieOvo: 创建多端点统一模型调用模块。
+    - 2026-04-22 JucieOvo: 将 OpenAI 兼容端点的图片 Base64 构造改为分块编码，降低瞬时内存峰值。
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from ollama import Client
+
+
+# OpenAI 兼容视觉请求最终仍需携带完整图片内容，这里仅避免先把整图原始字节整体读入内存。
+IMAGE_BASE64_CHUNK_SIZE = 1024 * 1024
 
 
 def resolve_api_key(
@@ -110,6 +115,42 @@ def _build_chat_openai_client(
     )
 
 
+def _encode_file_to_base64(file_path: str) -> str:
+    """
+    以分块方式将本地文件编码为 Base64 字符串。
+
+    该实现保留最终请求所需的完整 Base64 文本，但避免先额外生成一份完整原始字节副本。
+
+    :param file_path: 文件路径。
+    :return: Base64 编码字符串。
+    """
+    encoded_chunks: list[str] = []
+    pending_bytes = b""
+
+    with open(file_path, "rb") as file:
+        while True:
+            chunk = file.read(IMAGE_BASE64_CHUNK_SIZE)
+            if not chunk:
+                break
+
+            combined_chunk = pending_bytes + chunk
+            remainder_length = len(combined_chunk) % 3
+
+            if remainder_length:
+                pending_bytes = combined_chunk[-remainder_length:]
+                combined_chunk = combined_chunk[:-remainder_length]
+            else:
+                pending_bytes = b""
+
+            if combined_chunk:
+                encoded_chunks.append(base64.b64encode(combined_chunk).decode("ascii"))
+
+    if pending_bytes:
+        encoded_chunks.append(base64.b64encode(pending_bytes).decode("ascii"))
+
+    return "".join(encoded_chunks)
+
+
 def _image_to_data_url(image_path: str) -> str:
     """
     将本地图片文件转换为 data URL。
@@ -121,8 +162,7 @@ def _image_to_data_url(image_path: str) -> str:
     if not mime_type:
         mime_type = "application/octet-stream"
 
-    with open(image_path, "rb") as file:
-        encoded = base64.b64encode(file.read()).decode("utf-8")
+    encoded = _encode_file_to_base64(image_path)
     return f"data:{mime_type};base64,{encoded}"
 
 

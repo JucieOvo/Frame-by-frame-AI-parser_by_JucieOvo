@@ -24,6 +24,7 @@
 创建日期：2026-04-21
 修改记录：
     - 2026-04-21 JucieOvo: 创建批量任务硬盘缓存与状态持久化模块。
+    - 2026-04-22 JucieOvo: 将上传文件写盘与摘要计算改为分块读取，避免整段媒体缓冲驱动主链路。
 """
 
 from __future__ import annotations
@@ -42,6 +43,9 @@ from video_ai_suite.backend.runtime import get_program_cache_dir
 
 # 任务元数据会被批量线程并发更新，这里统一使用可重入锁保护读写与统计回写顺序。
 _JOB_STORAGE_LOCK = threading.RLock()
+
+# 上传文件在写盘和摘要计算阶段统一采用分块读取，避免业务层再次依赖整段媒体缓冲。
+UPLOAD_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 def _now_string() -> str:
@@ -368,7 +372,12 @@ def write_uploaded_file(batch_id: str, job_id: str, uploaded_file: Any) -> str:
     os.makedirs(os.path.dirname(source_path), exist_ok=True)
     uploaded_file.seek(0)
     with open(source_path, "wb") as file:
-        file.write(uploaded_file.getbuffer())
+        while True:
+            chunk = uploaded_file.read(UPLOAD_STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            file.write(chunk)
+    uploaded_file.seek(0)
 
     update_job_state(
         batch_id,
@@ -566,14 +575,18 @@ def list_result_jobs() -> list[dict[str, Any]]:
     return results
 
 
-def compute_uploaded_file_digest(uploaded_file: Any) -> str:
+def compute_file_digest(file_path: str) -> str:
     """
-    计算上传文件的稳定摘要值。
+    基于已落盘文件路径计算稳定摘要值。
 
-    :param uploaded_file: Streamlit UploadedFile 对象。
+    :param file_path: 已存在的文件路径。
     :return: 十六进制摘要字符串。
     """
-    uploaded_file.seek(0)
-    digest = hashlib.sha256(uploaded_file.getbuffer()).hexdigest()
-    uploaded_file.seek(0)
-    return digest
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as file:
+        while True:
+            chunk = file.read(UPLOAD_STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()

@@ -22,7 +22,6 @@
 """
 
 import asyncio
-import base64
 import glob
 import json
 import os
@@ -31,7 +30,6 @@ import subprocess
 import sys
 import threading
 import time
-from io import BytesIO
 from typing import List
 
 from video_ai_suite.backend.runtime import (
@@ -43,7 +41,7 @@ from video_ai_suite.backend.runtime import (
 )
 from video_ai_suite.backend.batch_scheduler import run_batch_jobs
 from video_ai_suite.backend.job_storage import (
-    compute_uploaded_file_digest,
+    compute_file_digest,
     create_batch_record,
     create_job_record,
     get_job_paths,
@@ -561,11 +559,13 @@ def prepare_single_job_runtime(
     original_name = uploaded_file.name if uploaded_file else f"{source_type}.mp4"
     job_manifest = create_job_record(batch_manifest["batch_id"], original_name)
     if uploaded_file is not None:
-        write_uploaded_file(batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file)
+        source_video_path = write_uploaded_file(
+            batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file
+        )
         update_job_manifest(
             batch_manifest["batch_id"],
             job_manifest["job_id"],
-            upload_digest=compute_uploaded_file_digest(uploaded_file),
+            upload_digest=compute_file_digest(source_video_path),
         )
 
     apply_result_job_to_session(batch_manifest["batch_id"], job_manifest["job_id"])
@@ -595,11 +595,13 @@ def prepare_uploaded_batch_jobs(uploaded_files: list) -> tuple[dict, list[dict]]
     job_manifests = []
     for uploaded_file in uploaded_files:
         job_manifest = create_job_record(batch_manifest["batch_id"], uploaded_file.name)
-        write_uploaded_file(batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file)
+        source_video_path = write_uploaded_file(
+            batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file
+        )
         update_job_manifest(
             batch_manifest["batch_id"],
             job_manifest["job_id"],
-            upload_digest=compute_uploaded_file_digest(uploaded_file),
+            upload_digest=compute_file_digest(source_video_path),
         )
         job_manifests.append(load_job_manifest(batch_manifest["batch_id"], job_manifest["job_id"]))
 
@@ -1758,19 +1760,6 @@ def run_asr_analysis(video_path):
         import traceback
 
         traceback.print_exc()
-        return None
-
-
-# --- 图片处理模块 ---
-def read_image_as_base64(image_path):
-    """读取图片文件并转换为Base64编码字符串"""
-    try:
-        with open(image_path, "rb") as img_file:
-            image_data = img_file.read()
-            base64_bytes = base64.b64encode(image_data)
-            return base64_bytes.decode("utf-8").strip()
-    except Exception as e:
-        st.error(f"读取或编码图片 {image_path} 时出错: {e}")
         return None
 
 
