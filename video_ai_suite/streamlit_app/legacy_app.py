@@ -19,6 +19,7 @@
 创建日期：2026-04-20
 修改记录：
     - 2026-04-20 JucieOvo: 接入正式拆分后的启动项、后端能力与 Streamlit 状态初始化。
+    - 2026-04-22 JucieOvo: 将大文件入口从 Streamlit 上传控件改为本地路径模式，降低会话层内存占用。
 """
 
 import asyncio
@@ -38,9 +39,12 @@ from video_ai_suite.backend.runtime import (
     get_program_cache_dir,
     list_image_files,
     resolve_keyframe_directory,
+    resolve_video_directory,
+    resolve_video_file,
 )
 from video_ai_suite.backend.batch_scheduler import run_batch_jobs
 from video_ai_suite.backend.job_storage import (
+    copy_video_file_to_job,
     compute_file_digest,
     create_batch_record,
     create_job_record,
@@ -52,7 +56,6 @@ from video_ai_suite.backend.job_storage import (
     load_job_state,
     update_job_manifest,
     update_job_state,
-    write_uploaded_file,
 )
 from video_ai_suite.backend.model_clients import invoke_text_model, invoke_vision_model
 from video_ai_suite.backend.provider_settings import (
@@ -98,8 +101,6 @@ from video_ai_suite.streamlit_app.session_state import initialize_session_state
 from ollama import Client
 
 client = Client(host="http://localhost:11434")
-
-initialize_session_state()
 
 
 def reset_token_usage():
@@ -536,13 +537,13 @@ def render_llm_endpoint_selector(section_prefix: str = "llm") -> None:
 
 
 def prepare_single_job_runtime(
-    uploaded_file=None,
+    source_file_path: str | None = None,
     source_type: str = "single",
 ) -> tuple[str, str, dict]:
     """
     为单视频分析或关键帧再解析创建任务私有运行目录。
 
-    :param uploaded_file: 可选的上传视频对象。
+    :param source_file_path: 可选的本地视频文件路径。
     :param source_type: 任务来源类型。
     :return: 批次标识、任务标识、任务路径字典。
     """
@@ -556,11 +557,11 @@ def prepare_single_job_runtime(
         source_type=source_type,
     )
 
-    original_name = uploaded_file.name if uploaded_file else f"{source_type}.mp4"
+    original_name = os.path.basename(source_file_path) if source_file_path else f"{source_type}.mp4"
     job_manifest = create_job_record(batch_manifest["batch_id"], original_name)
-    if uploaded_file is not None:
-        source_video_path = write_uploaded_file(
-            batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file
+    if source_file_path:
+        source_video_path = copy_video_file_to_job(
+            batch_manifest["batch_id"], job_manifest["job_id"], source_file_path
         )
         update_job_manifest(
             batch_manifest["batch_id"],
@@ -575,11 +576,11 @@ def prepare_single_job_runtime(
     )
 
 
-def prepare_uploaded_batch_jobs(uploaded_files: list) -> tuple[dict, list[dict]]:
+def prepare_uploaded_batch_jobs(source_file_paths: list[str]) -> tuple[dict, list[dict]]:
     """
-    将多个上传视频写入新的批次任务目录。
+    将多个本地视频文件复制到新的批次任务目录。
 
-    :param uploaded_files: 上传文件列表。
+    :param source_file_paths: 本地视频文件路径列表。
     :return: 批次清单与任务清单列表。
     """
     batch_manifest = create_batch_record(
@@ -593,10 +594,12 @@ def prepare_uploaded_batch_jobs(uploaded_files: list) -> tuple[dict, list[dict]]
     )
 
     job_manifests = []
-    for uploaded_file in uploaded_files:
-        job_manifest = create_job_record(batch_manifest["batch_id"], uploaded_file.name)
-        source_video_path = write_uploaded_file(
-            batch_manifest["batch_id"], job_manifest["job_id"], uploaded_file
+    for source_file_path in source_file_paths:
+        job_manifest = create_job_record(
+            batch_manifest["batch_id"], os.path.basename(source_file_path)
+        )
+        source_video_path = copy_video_file_to_job(
+            batch_manifest["batch_id"], job_manifest["job_id"], source_file_path
         )
         update_job_manifest(
             batch_manifest["batch_id"],
@@ -608,11 +611,11 @@ def prepare_uploaded_batch_jobs(uploaded_files: list) -> tuple[dict, list[dict]]
     return batch_manifest, job_manifests
 
 
-def run_batch_video_analysis(uploaded_files: list) -> dict:
+def run_batch_video_analysis(source_file_paths: list[str]) -> dict:
     """
     执行批量视频分析。
 
-    :param uploaded_files: 批量上传的视频列表。
+    :param source_file_paths: 批量视频文件路径列表。
     :return: 批次执行结果摘要。
     """
     vision_endpoint = get_current_vlm_endpoint()
@@ -623,11 +626,11 @@ def run_batch_video_analysis(uploaded_files: list) -> dict:
         raise RuntimeError("未选择视觉模型")
 
     funasr_model_ref = None
-    if uploaded_files:
+    if source_file_paths:
         if setup_funasr_model():
             funasr_model_ref = st.session_state.funasr_model
 
-    batch_manifest, job_manifests = prepare_uploaded_batch_jobs(uploaded_files)
+    batch_manifest, job_manifests = prepare_uploaded_batch_jobs(source_file_paths)
     batch_id = batch_manifest["batch_id"]
     st.session_state.active_batch_id = batch_id
     st.session_state.batch_status_messages = []
@@ -3456,16 +3459,28 @@ def video_analysis_page():
                 step=1,
             )
 
+        batch_uploaded_files: list[str] = []
+        batch_video_error = ""
+        single_uploaded_file = ""
+        single_video_error = ""
+
         st.divider()
         if is_batch_mode:
-            batch_uploaded_files = st.file_uploader(
-                "上传多个视频文件",
-                type=["mp4", "avi", "mov", "mkv", "flv", "wmv"],
-                accept_multiple_files=True,
-                help="批量模式下可一次上传多个视频，系统会在启动后将每个视频写入项目 .cache 中的任务私有目录。",
+            batch_video_directory = st.text_input(
+                "本地批量视频文件夹路径",
+                key="batch_video_directory",
+                placeholder="例如：F:/Videos/ToAnalyze",
+                help="批量模式会直接读取本机文件夹中的视频路径，不再经由 Streamlit 上传大文件。",
             )
-            if batch_uploaded_files:
-                st.success(f"已选择 {len(batch_uploaded_files)} 个视频文件")
+            if batch_video_directory:
+                normalized_batch_dir, batch_uploaded_files, batch_video_error = resolve_video_directory(
+                    batch_video_directory
+                )
+                if batch_video_error:
+                    st.error(batch_video_error)
+                else:
+                    st.success(f"找到 {len(batch_uploaded_files)} 个视频文件")
+                    st.caption(f"目录：{normalized_batch_dir}")
         elif is_reparse_mode:
             st.session_state.use_existing_keyframes = True
             st.session_state.force_reparse_keyframes = True
@@ -3507,11 +3522,20 @@ def video_analysis_page():
                     "强制重新解析关键帧",
                     value=st.session_state.force_reparse_keyframes,
                 )
-            single_uploaded_file = st.file_uploader(
-                "上传视频文件",
-                type=["mp4", "avi", "mov", "mkv", "flv", "wmv"],
-                help="单视频模式会在开始分析时把视频写入项目 .cache 的任务私有目录中。",
+            single_uploaded_file = st.text_input(
+                "本地视频文件路径",
+                key="single_video_source_path",
+                placeholder="例如：F:/Videos/demo.mp4",
+                help="单视频模式会直接读取本机视频路径，再复制到项目 .cache 的任务私有目录中。",
             )
+            if single_uploaded_file and not st.session_state.use_existing_keyframes:
+                normalized_video_path, single_video_error = resolve_video_file(single_uploaded_file)
+                if single_video_error:
+                    st.error(single_video_error)
+                else:
+                    single_uploaded_file = normalized_video_path
+                    st.success(f"已选择本地视频：{os.path.basename(single_uploaded_file)}")
+                    st.caption(f"路径：{single_uploaded_file}")
             st.session_state.use_existing_vector_db = st.checkbox(
                 "使用已有向量数据库",
                 value=st.session_state.use_existing_vector_db,
@@ -3532,7 +3556,7 @@ def video_analysis_page():
         if is_batch_mode:
             if not batch_uploaded_files:
                 can_start = False
-                disable_reason = "请先上传至少一个视频文件"
+                disable_reason = batch_video_error or "请先提供至少一个可用的视频文件"
             else:
                 can_start = True
                 disable_reason = ""
@@ -3565,12 +3589,16 @@ def video_analysis_page():
                     else:
                         can_start = True
                         disable_reason = ""
-            elif single_uploaded_file is not None:
-                can_start = True
-                disable_reason = ""
             else:
-                can_start = False
-                disable_reason = "请先上传视频"
+                if single_uploaded_file and not single_video_error:
+                    can_start = True
+                    disable_reason = ""
+                elif single_video_error:
+                    can_start = False
+                    disable_reason = single_video_error
+                else:
+                    can_start = False
+                    disable_reason = "请先输入本地视频路径"
 
         if is_batch_mode:
             start_batch_analysis = st.button(
@@ -3602,17 +3630,17 @@ def video_analysis_page():
 
     if start_single_analysis:
         st.session_state.vector_store = None
-        if single_uploaded_file is not None and not (
+        if single_uploaded_file and not (
             is_reparse_mode or st.session_state.use_existing_keyframes
         ):
             batch_id, job_id, job_paths = prepare_single_job_runtime(
-                single_uploaded_file,
-                source_type="single_upload",
+                source_file_path=single_uploaded_file,
+                source_type="single_local_path",
             )
             st.session_state.video_path = job_paths["source_video_path"]
         else:
             batch_id, job_id, job_paths = prepare_single_job_runtime(
-                uploaded_file=None,
+                source_file_path=None,
                 source_type="keyframe_reparse",
             )
             st.session_state.video_path = None
@@ -4112,6 +4140,9 @@ def main():
     st.set_page_config(
         page_title="视频智能分析处理套件 v3.0", page_icon="🎬", layout="wide"
     )
+
+    # Streamlit 的模块导入会被 Python 缓存复用，状态初始化必须放在每次页面运行都会经过的入口。
+    initialize_session_state()
 
     # 页面导航
     st.sidebar.title("导航")

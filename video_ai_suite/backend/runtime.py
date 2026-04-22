@@ -2,12 +2,15 @@
 模块名称：runtime
 功能描述：
     提供项目运行时的公共基础能力。
-    该模块统一负责程序目录识别、缓存目录环境变量初始化、图片目录解析与关键帧目录校验。
+    该模块统一负责程序目录识别、缓存目录环境变量初始化、图片目录解析、视频路径校验与关键帧目录校验。
 
 主要组件：
     - get_program_dir: 获取程序运行根目录。
     - early_set_cache_env: 在导入模型依赖前设置缓存环境变量。
     - list_image_files: 读取目录中的关键帧图片文件。
+    - list_video_files: 读取目录中的视频文件。
+    - resolve_video_file: 规范化并校验单个视频文件路径。
+    - resolve_video_directory: 规范化并校验批量视频目录。
     - resolve_keyframe_directory: 规范化并校验关键帧目录。
 
 依赖说明：
@@ -18,6 +21,8 @@
 创建日期：2026-04-20
 修改记录：
     - 2026-04-20 JucieOvo: 从原始单文件应用中抽离运行时公共能力。
+    - 2026-04-22 JucieOvo: 增加本地视频文件与目录校验能力，用于替代 Streamlit 上传控件。
+    - 2026-04-22 JucieOvo: 移除已废弃的 TRANSFORMERS_CACHE 环境变量写入，避免启动警告。
 """
 
 from __future__ import annotations
@@ -28,6 +33,10 @@ import sys
 # 关键帧图片支持的扩展名集合。
 # 统一集中定义，避免不同读取入口的过滤规则不一致。
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+# 视频文件支持的扩展名集合。
+# 统一集中定义，保证单文件与批量模式使用相同的过滤规则。
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv")
 
 
 def get_program_dir() -> str:
@@ -69,20 +78,15 @@ def early_set_cache_env() -> str:
     os.environ["MODELSCOPE_HOME"] = os.path.join(cache_dir, "modelscope")
     os.environ["HF_HOME"] = os.path.join(cache_dir, "huggingface")
     os.environ["HF_HUB_CACHE"] = os.path.join(cache_dir, "huggingface", "hub")
-    os.environ["TRANSFORMERS_CACHE"] = os.path.join(
-        cache_dir,
-        "huggingface",
-        "transformers",
-    )
     os.environ["TORCH_HOME"] = os.path.join(cache_dir, "torch")
     os.environ["MODELSCOPE_SDK_DEBUG"] = "0"
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ.pop("TRANSFORMERS_CACHE", None)
 
     for directory in [
         os.environ["MODELSCOPE_CACHE_DIR"],
         os.environ["HF_HOME"],
-        os.environ["TRANSFORMERS_CACHE"],
         os.environ["TORCH_HOME"],
     ]:
         os.makedirs(directory, exist_ok=True)
@@ -152,6 +156,81 @@ def list_image_files(directory: str | None) -> list[str]:
         raise OSError(f"读取目录失败: {normalized_dir}，原因: {str(exc)}") from exc
 
     return image_files
+
+
+def list_video_files(directory: str | None) -> list[str]:
+    """
+    安全读取目录中的视频文件。
+
+    :param directory: 目标目录。
+    :return: 视频文件绝对路径列表。
+    :raises OSError: 当目录读取失败时抛出异常。
+    """
+    normalized_dir = normalize_user_path(directory)
+    if not normalized_dir:
+        return []
+
+    video_files: list[str] = []
+    try:
+        with os.scandir(normalized_dir) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(VIDEO_EXTENSIONS):
+                    video_files.append(entry.path)
+    except OSError as exc:
+        raise OSError(f"读取目录失败: {normalized_dir}，原因: {str(exc)}") from exc
+
+    return video_files
+
+
+def resolve_video_file(path_value: str | None) -> tuple[str, str]:
+    """
+    规范化并校验单个视频文件路径。
+
+    :param path_value: 用户输入的视频文件路径。
+    :return: 规范化后的视频路径与错误信息。
+    """
+    normalized_path = normalize_user_path(path_value)
+    if not normalized_path:
+        return "", "视频路径为空"
+
+    if not os.path.exists(normalized_path):
+        return normalized_path, "视频路径不存在"
+
+    if not os.path.isfile(normalized_path):
+        return normalized_path, "视频路径不是文件"
+
+    if not normalized_path.lower().endswith(VIDEO_EXTENSIONS):
+        return normalized_path, "视频文件扩展名不受支持"
+
+    return normalized_path, ""
+
+
+def resolve_video_directory(path_value: str | None) -> tuple[str, list[str], str]:
+    """
+    规范化并校验批量视频目录。
+
+    :param path_value: 用户输入的视频目录路径。
+    :return: 目录路径、视频文件列表、错误信息。
+    """
+    normalized_dir = normalize_user_path(path_value)
+    if not normalized_dir:
+        return "", [], "视频目录路径为空"
+
+    if not os.path.exists(normalized_dir):
+        return normalized_dir, [], "视频目录路径不存在"
+
+    if not os.path.isdir(normalized_dir):
+        return normalized_dir, [], "视频目录路径不是文件夹"
+
+    try:
+        video_files = list_video_files(normalized_dir)
+    except OSError as exc:
+        return normalized_dir, [], str(exc)
+
+    if not video_files:
+        return normalized_dir, [], "视频目录中没有可处理的视频文件"
+
+    return normalized_dir, sorted(video_files), ""
 
 
 def resolve_keyframe_directory(path_value: str | None) -> tuple[str, list[str], str]:
